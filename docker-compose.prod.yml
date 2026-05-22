@@ -1,0 +1,93 @@
+# ============================================================================
+# WEEK 4 - DAY 24: Production Docker Compose
+# ============================================================================
+# Production-ready orchestration with backend + frontend
+
+version: '3.8'
+
+services:
+  # Backend API
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: appvideoai-backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Supabase
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      
+      # AI APIs
+      - FAL_KEY=${FAL_KEY}
+      
+      # Payment Gateways
+      - CCBILL_WEBHOOK_SECRET=${CCBILL_WEBHOOK_SECRET}
+      - SEGPAY_WEBHOOK_SECRET=${SEGPAY_WEBHOOK_SECRET}
+      - EPOCH_WEBHOOK_SECRET=${EPOCH_WEBHOOK_SECRET}
+      
+      # Security
+      - MIN_AGE_THRESHOLD=25
+      - EPHEMERAL_STORAGE_PATH=/tmp/appvideoai
+      
+      # Monitoring
+      - SENTRY_DSN=${SENTRY_DSN}
+      - ENVIRONMENT=production
+      
+    volumes:
+      # Ephemeral storage (tmpfs for GDPR compliance)
+      - type: tmpfs
+        target: /tmp/appvideoai
+        tmpfs:
+          size: 2G
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+  
+  # Frontend (Streamlit)
+  frontend:
+    image: python:3.10-slim
+    container_name: appvideoai-frontend
+    working_dir: /app
+    command: >
+      bash -c "pip install streamlit requests python-dotenv &&
+               streamlit run app.py --server.port 8501 --server.address 0.0.0.0"
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE_URL=http://backend:8000
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    
+    volumes:
+      - ./app.py:/app/app.py:ro
+      - ./auth_handler.py:/app/auth_handler.py:ro
+    
+    depends_on:
+      backend:
+        condition: service_healthy
+    
+    restart: unless-stopped
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+networks:
+  default:
+    name: appvideoai-network
