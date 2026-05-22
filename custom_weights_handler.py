@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from dotenv import load_dotenv
+from path_config import CARTELLA_CHECKPOINT_PERSONALIZZATI_PATH
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -208,7 +209,7 @@ class CustomWeightsHandler:
         """
         load_dotenv()
         
-        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else Path("./custom_checkpoints")
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else CARTELLA_CHECKPOINT_PERSONALIZZATI_PATH
         self.checkpoint_dir.mkdir(exist_ok=True)
         
         self.api_key = api_key or os.getenv("FAL_KEY") or os.getenv("REPLICATE_API_TOKEN")
@@ -463,7 +464,7 @@ if __name__ == "__main__":
     
     checkpoint2 = handler.register_checkpoint(
         name="anatomy_lora",
-        path="./custom_checkpoints/anatomy_lora.safetensors",
+        path=f"{CARTELLA_CHECKPOINT_PERSONALIZZATI_PATH}/anatomy_lora.safetensors",
         checkpoint_type=CheckpointType.LORA,
         weight_strength=0.6,
         metadata={"focus": "anatomical accuracy"}

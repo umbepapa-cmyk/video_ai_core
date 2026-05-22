@@ -52,6 +52,7 @@ from monitoring import (
     alert_manager,
     init_sentry_monitoring
 )
+from path_config import CARTELLA_VOLTI_PREDEFINITI
 
 # Week 4 imports
 from payment_handler import (
@@ -807,7 +808,7 @@ async def generate_video_v2_celery(
         task = generate_video_task.apply_async(
             kwargs={
                 'user_id': user_email,  # TODO: Use actual user_id from auth
-                'reference_faces_dir': reference_faces_dir or "./default_faces",  # TODO: Handle missing video
+                'reference_faces_dir': reference_faces_dir or CARTELLA_VOLTI_PREDEFINITI,  # TODO: Handle missing video
                 'prompt': prompt,
                 'duration_seconds': float(duration_seconds),
                 'controlnet_map_path': controlnet_map_path,

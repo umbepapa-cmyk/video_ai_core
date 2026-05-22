@@ -29,6 +29,13 @@ import aiofiles
 
 from dotenv import load_dotenv
 
+# Import path configuration
+from path_config import (
+    CARTELLA_RISULTATI,
+    CARTELLA_RISULTATI_TEST,
+    CARTELLA_VOLTI_RIFERIMENTO_TEST
+)
+
 try:
     import fal_client
 except ImportError:
@@ -108,7 +115,7 @@ class CoreEngineConfig:
     flickering_suppression: float = 0.8
     
     # Output settings
-    output_path: str = "./outputs/"
+    output_path: str = CARTELLA_RISULTATI
 
 
 @dataclass
@@ -981,13 +988,13 @@ if __name__ == "__main__":
         print("-" * 70)
         
         config = CoreEngineConfig(
-            reference_faces_dir="./test_reference_faces",
+            reference_faces_dir=CARTELLA_VOLTI_RIFERIMENTO_TEST,
             num_angles=5,
             duration_seconds=10.0,
             fps=24,
             quality_preset=QualityPreset.HIGH,
             enable_autoregressive=True,
-            output_path="./test_outputs/"
+            output_path=CARTELLA_RISULTATI_TEST
         )
         
         print(f"✓ Configuration created")
@@ -1016,10 +1023,10 @@ if __name__ == "__main__":
         prompt = "A woman gracefully dancing, elegant movements, cinematic lighting"
         
         result = await engine.generate_high_fidelity_video(
-            reference_faces_dir="./test_reference_faces",
+            reference_faces_dir=CARTELLA_VOLTI_RIFERIMENTO_TEST,
             prompt=prompt,
             duration_seconds=10,
-            output_path="./test_outputs/"
+            output_path=CARTELLA_RISULTATI_TEST
         )
         
         print(f"\n✓ Pipeline execution complete!")
@@ -1052,10 +1059,10 @@ if __name__ == "__main__":
         print("-" * 70)
         
         quick_result = await generate_high_fidelity_video(
-            reference_faces_dir="./test_reference_faces",
+            reference_faces_dir=CARTELLA_VOLTI_RIFERIMENTO_TEST,
             prompt="A person walking, natural movement",
             duration_seconds=5,
-            output_path="./test_outputs/"
+            output_path=CARTELLA_RISULTATI_TEST
         )
         
         print(f"✓ Quick generation complete")

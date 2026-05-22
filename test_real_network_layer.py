@@ -22,6 +22,7 @@ import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
+from path_config import CARTELLA_VOLTI_RIFERIMENTO_TEST, CARTELLA_RISULTATI_TEST
 from core_engine import (
     CoreEngine,
     CoreEngineConfig,
@@ -47,11 +48,11 @@ async def test_first_frame_generation():
         from core_engine import CoreEngine, CoreEngineConfig, QualityPreset
         
         config = CoreEngineConfig(
-            reference_faces_dir="./test_reference_faces",
+            reference_faces_dir=CARTELLA_VOLTI_RIFERIMENTO_TEST,
             duration_seconds=5.0,
             quality_preset=QualityPreset.HIGH,
             enable_autoregressive=False,  # Test single segment only
-            output_path="./test_outputs/"
+            output_path=CARTELLA_RISULTATI_TEST
         )
         
         engine = CoreEngine(config=config)
@@ -149,7 +150,7 @@ async def test_video_download(video_result: dict):
         logger.info("Calling _finalize_video to download...")
         local_path = await engine._finalize_video(
             video_result=video_result,
-            output_path="./test_outputs/"
+            output_path=CARTELLA_RISULTATI_TEST
         )
         
         # Verify file exists
@@ -177,10 +178,10 @@ async def test_full_pipeline():
     
     try:
         result = await generate_high_fidelity_video(
-            reference_faces_dir="./test_reference_faces",
+            reference_faces_dir=CARTELLA_VOLTI_RIFERIMENTO_TEST,
             prompt="A person smiling naturally, professional portrait",
             duration_seconds=5,
-            output_path="./test_outputs/"
+            output_path=CARTELLA_RISULTATI_TEST
         )
         
         logger.info(f"✓ Test 4 PASSED")

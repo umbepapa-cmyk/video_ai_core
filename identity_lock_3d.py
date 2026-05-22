@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dotenv import load_dotenv
+from path_config import CARTELLA_VOLTI_RIFERIMENTO_TEST_PATH
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -511,7 +512,7 @@ if __name__ == "__main__":
     print("-" * 70)
     
     # Create mock reference directory
-    ref_dir = Path("./test_reference_faces")
+    ref_dir = CARTELLA_VOLTI_RIFERIMENTO_TEST_PATH
     ref_dir.mkdir(exist_ok=True)
     
     locker = MultiAngleIdentityLock(

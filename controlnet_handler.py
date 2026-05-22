@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 
 from dotenv import load_dotenv
+from path_config import CARTELLA_MAPPE_POSE
 
 try:
     import fal_client
@@ -467,7 +468,7 @@ class ControlNetHandler:
 
 # Convenience functions
 
-def generate_pose_map(image_path: str, output_dir: str = "./pose_maps") -> str:
+def generate_pose_map(image_path: str, output_dir: str = CARTELLA_MAPPE_POSE) -> str:
     """
     Quick function to generate pose map from image.
     
@@ -555,7 +556,7 @@ if __name__ == "__main__":
         
         pose_map_path, keypoints = handler.generate_pose_map(
             temp_image_path,
-            output_dir="./test_outputs"
+            output_dir=CARTELLA_RISULTATI_TEST
         )
         print(f"✓ Pose map saved to: {pose_map_path}")
         
