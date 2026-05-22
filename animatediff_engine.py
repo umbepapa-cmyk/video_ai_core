@@ -13,7 +13,7 @@ This module implements:
 
 import os
 import logging
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
@@ -31,6 +31,48 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+async def retry_with_backoff(
+    func: Callable,
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    exceptions: Tuple = (Exception,)
+) -> Any:
+    """
+    Retry a function with exponential backoff.
+    
+    Args:
+        func: Async function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        backoff_factor: Multiplier for each retry
+        exceptions: Tuple of exceptions to catch and retry
+        
+    Returns:
+        Result from successful function call
+        
+    Raises:
+        Last exception if all retries fail
+    """
+    delay = initial_delay
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except exceptions as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+                logger.info(f"Retrying in {delay:.1f}s...")
+                await asyncio.sleep(delay)
+                delay *= backoff_factor
+            else:
+                logger.error(f"All {max_retries} attempts failed")
+    
+    raise last_exception
 
 
 class MotionPreset(Enum):
@@ -357,7 +399,8 @@ class AnimateDiffEngine:
         if payload.get("negative_prompt"):
             api_payload["negative_prompt"] = payload["negative_prompt"]
         
-        try:
+        # Define the actual API call as a nested async function for retry
+        async def _api_call():
             logger.info(f"Submitting to Fal.ai Wan I2V...")
             logger.info(f"  Image: {api_payload['image_url']}")
             logger.info(f"  Duration: {api_payload['duration']}s")
@@ -408,12 +451,21 @@ class AnimateDiffEngine:
                 logger.info(f"  Last frame: {last_frame_url}")
             
             return video_url, metadata
+        
+        # Execute with retry logic
+        try:
+            import httpx
+            result = await retry_with_backoff(
+                _api_call,
+                max_retries=3,
+                initial_delay=5.0,  # Longer initial delay for video generation
+                backoff_factor=2.0,
+                exceptions=(httpx.HTTPError, asyncio.TimeoutError, ValueError, RuntimeError)
+            )
+            return result
             
-        except asyncio.TimeoutError:
-            logger.error("API call timed out after 300s")
-            raise
         except Exception as e:
-            logger.error(f"API call failed: {type(e).__name__}: {e}")
+            logger.error(f"AnimateDiff API call failed after all retries: {type(e).__name__}: {e}")
             raise RuntimeError(f"AnimateDiff API call failed: {e}") from e
     
     def _get_default_negative_prompt(self) -> str:
@@ -759,7 +811,7 @@ if __name__ == "__main__":
         print("\nTest 7: Extract Last Frame")
         print("-" * 70)
         
-        last_frame = engine.extract_last_frame(result.video_url)
+        last_frame = await engine.extract_last_frame(result.video_url)
         print(f"✓ Last frame extracted: {last_frame}")
         
         print(f"\n{'='*70}")

@@ -545,7 +545,8 @@ class CoreEngine:
             # This may require a different endpoint like "fal-ai/flux-controlnet"
             logger.info(f"ControlNet data available but not yet integrated with Flux endpoint")
         
-        try:
+        # Define the actual API call as a nested async function for retry
+        async def _api_call():
             logger.info(f"Submitting first frame generation to Fal.ai...")
             logger.info(f"  Prompt: {payload['prompt'][:80]}...")
             
@@ -572,12 +573,20 @@ class CoreEngine:
             logger.info(f"  URL: {image_url}")
             
             return image_url
+        
+        # Execute with retry logic
+        try:
+            image_url = await retry_with_backoff(
+                _api_call,
+                max_retries=3,
+                initial_delay=2.0,
+                backoff_factor=2.0,
+                exceptions=(httpx.HTTPError, asyncio.TimeoutError, ValueError, RuntimeError)
+            )
+            return image_url
             
-        except asyncio.TimeoutError:
-            logger.error("First frame generation timed out after 120s")
-            raise
         except Exception as e:
-            logger.error(f"First frame generation failed: {type(e).__name__}: {e}")
+            logger.error(f"First frame generation failed after all retries: {type(e).__name__}: {e}")
             raise RuntimeError(f"Failed to generate first frame: {e}") from e
     
     async def _generate_single_video(
@@ -654,7 +663,8 @@ class CoreEngine:
         if "negative_prompt" in prompts and prompts["negative_prompt"]:
             payload["negative_prompt"] = prompts["negative_prompt"]
         
-        try:
+        # Define the actual API call as a nested async function for retry
+        async def _api_call():
             logger.info(f"Submitting video generation to Fal.ai Wan I2V...")
             logger.info(f"  First frame: {first_frame_url}")
             logger.info(f"  Duration: {duration}s")
@@ -693,12 +703,20 @@ class CoreEngine:
                 'mean_drift': 0.0,
                 'temporal_consistency': 1.0
             }
+        
+        # Execute with retry logic
+        try:
+            result = await retry_with_backoff(
+                _api_call,
+                max_retries=3,
+                initial_delay=5.0,  # Longer initial delay for video generation
+                backoff_factor=2.0,
+                exceptions=(httpx.HTTPError, asyncio.TimeoutError, ValueError, RuntimeError)
+            )
+            return result
             
-        except asyncio.TimeoutError:
-            logger.error(f"Video generation timed out after 300s")
-            raise
         except Exception as e:
-            logger.error(f"Video generation failed: {type(e).__name__}: {e}")
+            logger.error(f"Video generation failed after all retries: {type(e).__name__}: {e}")
             raise RuntimeError(f"Failed to generate video: {e}") from e
     
     async def _generate_autoregressive_video(
@@ -811,7 +829,8 @@ class CoreEngine:
         logger.info(f"Downloading video from: {video_url}")
         logger.info(f"Saving to: {local_path}")
         
-        try:
+        # Define the actual download as a nested async function for retry
+        async def _download():
             # Download with streaming for large files
             async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
                 async with client.stream("GET", video_url) as response:
@@ -851,15 +870,20 @@ class CoreEngine:
             logger.info(f"  File size: {file_size / 1024 / 1024:.2f} MB")
             
             return str(local_path.absolute())
+        
+        # Execute with retry logic
+        try:
+            result = await retry_with_backoff(
+                _download,
+                max_retries=3,
+                initial_delay=3.0,
+                backoff_factor=2.0,
+                exceptions=(httpx.HTTPError, httpx.TimeoutException, IOError)
+            )
+            return result
             
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error during download: {e.response.status_code} - {e.response.text}")
-            raise RuntimeError(f"Failed to download video: HTTP {e.response.status_code}") from e
-        except httpx.TimeoutException as e:
-            logger.error(f"Download timed out after 120s")
-            raise RuntimeError("Video download timed out") from e
         except Exception as e:
-            logger.error(f"Video download failed: {type(e).__name__}: {e}")
+            logger.error(f"Video download failed after all retries: {type(e).__name__}: {e}")
             # Clean up partial download if it exists
             if local_path.exists():
                 try:
