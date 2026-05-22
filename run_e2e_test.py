@@ -4,8 +4,8 @@ End-to-End Kinematic Integration Test
 =====================================
 
 Valida l'intero flusso architetturale:
-1. Ingestione biometrica (frame extraction)
-2. Orchestrazione video (core_engine + dynamic retriever)
+1. Ingestione biometrica (frame extraction da tutti i video + foto in inputs/)
+2. Orchestrazione video (core_engine + dynamic retriever opzionale)
 3. Teardown GDPR-compliant
 
 Usage:
@@ -14,17 +14,21 @@ Usage:
 
 import asyncio
 import logging
-import time
+import os
 import shutil
+import time
 from pathlib import Path
 import sys
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
-# Import dei moduli del progetto
+from dotenv import load_dotenv
+
 from frame_extractor import extract_and_save_frames_for_identity
-from core_engine import generate_high_fidelity_video
+from generation_progress import estimate_pipeline_seconds, format_eta_range
+from core_engine import CoreEngine, CoreEngineConfig, QualityPreset, generate_high_fidelity_video
 
-# Setup logging dettagliato
+load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -35,111 +39,238 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Percorsi
-INPUT_DIR = Path("inputs")
-INPUT_VIDEO = INPUT_DIR / "mio_selfie.mp4"
+INPUT_DIR = Path("inputs/Soggetto 1")
 TEMP_FACES_DIR = Path("tmpfs/test_faces")
 OUTPUT_DIR = Path("outputs/e2e_test")
 
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def safe_rmtree(path: Path, max_retries: int = 3) -> None:
+    """Remove directory tree with retry for Windows file locks."""
+    if not path.exists():
+        return
+    for attempt in range(max_retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+                logger.warning("Teardown used ignore_errors for %s", path)
+
+
+def get_reference_faces_dir() -> str:
+    """Absolute resolved path to temp reference faces (Windows-safe)."""
+    return str(TEMP_FACES_DIR.resolve())
+
+
+E2E_PROMPT = (
+    "Cinematic sports broadcast tracking shot. Starts with an extreme close-up of the male "
+    "Olympic diver's face showing deep concentration, sweat on his forehead. The camera "
+    "dynamically pulls back and sweeps up to a high-angle top-down view as he gracefully "
+    "leaps off the platform, executing a flawless triple somersault dive into the bright "
+    "blue pool. Photorealistic, 8k resolution, dynamic lighting, professional TV broadcast "
+    "style, ultra-detailed."
+)
+E2E_MOTION_KEYWORD = "olympic diver concentration and platform dive"
+E2E_DURATION_SECONDS = 10
+E2E_SEGMENT_DURATION = 5.0
+E2E_ENABLE_AUTOREGRESSIVE = True
+FRAMES_PER_VIDEO = 5
+LAPLACIAN_THRESHOLD = 30.0
+
+# Stats for final report
+_test_stats: Dict[str, Any] = {
+    "videos_found": 0,
+    "photos_found": 0,
+    "frames_extracted": 0,
+    "photos_copied": 0,
+    "motion_reference_path": None,
+}
+
+
+def discover_input_media(input_dir: Path) -> Tuple[List[Path], List[Path]]:
+    """Scan inputs/ recursively for videos and photos."""
+    videos: List[Path] = []
+    photos: List[Path] = []
+
+    if not input_dir.exists():
+        return videos, photos
+
+    for path in sorted(input_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext in VIDEO_EXTENSIONS:
+            videos.append(path)
+        elif ext in PHOTO_EXTENSIONS:
+            photos.append(path)
+
+    return videos, photos
+
+
+def _sanitize_prefix(name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    return safe.strip("_") or "media"
+
+
+def copy_photos_to_reference(photos: List[Path], output_dir: Path) -> int:
+    """Copy photo references into the unified reference directory."""
+    copied = 0
+    for photo in photos:
+        prefix = _sanitize_prefix(photo.parent.name) if photo.parent != INPUT_DIR else "root"
+        dest_name = f"photo_{prefix}_{photo.stem}{photo.suffix.lower()}"
+        dest_path = output_dir / dest_name
+
+        if dest_path.exists() and dest_path.stat().st_size == photo.stat().st_size:
+            logger.info(f"  Foto già presente: {dest_name}")
+            copied += 1
+            continue
+
+        shutil.copy2(photo, dest_path)
+        logger.info(f"  Copiata foto: {photo.name} -> {dest_name}")
+        copied += 1
+
+    return copied
+
+
+def check_prerequisites() -> bool:
+    """Verify FAL_KEY, fal-client, and FFmpeg availability."""
+    logger.info("Verifica prerequisiti...")
+
+    fal_key = os.getenv("FAL_KEY", "")
+    if not fal_key or fal_key.strip() in ("", "your_fal_api_key_here"):
+        logger.warning("FAL_KEY non configurata o placeholder in .env — la Fase 2 probabilmente fallirà")
+    else:
+        logger.info("✓ FAL_KEY configurata")
+
+    try:
+        import fal_client  # noqa: F401
+        logger.info("✓ fal-client installato")
+    except ImportError:
+        logger.error("fal-client mancante — eseguire: pip install -r requirements.txt")
+        return False
+
+    ffmpeg_ok = shutil.which("ffmpeg") is not None
+    if ffmpeg_ok:
+        logger.info("✓ FFmpeg disponibile")
+    else:
+        logger.warning("FFmpeg non trovato nel PATH — alcune operazioni video potrebbero fallire")
+
+    return True
+
 
 async def setup_phase() -> bool:
-    """
-    Fase Setup: Prepara directories e verifica input
-    """
-    logger.info("="*70)
+    """Prepare directories and verify input material exists."""
+    logger.info("=" * 70)
     logger.info("FASE SETUP - Preparazione ambiente test")
-    logger.info("="*70)
-    
+    logger.info("=" * 70)
+
     start_time = time.time()
-    
-    # Crea directory inputs se non esiste
+
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Verifica presenza video selfie
-    if not INPUT_VIDEO.exists():
-        logger.warning(f"Video selfie non trovato: {INPUT_VIDEO}")
-        logger.info("")
-        logger.info("="*70)
-        logger.info("ISTRUZIONI PER FORNIRE IL VIDEO SELFIE")
-        logger.info("="*70)
-        logger.info("")
-        logger.info("Per eseguire questo test E2E, è necessario un video selfie.")
-        logger.info("")
-        logger.info("Opzioni:")
-        logger.info("  1. Registra un breve video selfie (5-10 secondi)")
-        logger.info("  2. Salva il video come: inputs/mio_selfie.mp4")
-        logger.info("  3. Esegui nuovamente questo script")
-        logger.info("")
-        logger.info("Requisiti video:")
-        logger.info("  - Formato: MP4")
-        logger.info("  - Durata: 5-30 secondi")
-        logger.info("  - Qualità: 720p o superiore")
-        logger.info("  - Contenuto: Viso chiaramente visibile")
-        logger.info("  - Illuminazione: Buona (evitare controluce)")
-        logger.info("")
-        logger.info("="*70)
-        logger.error("ERRORE: Fornire un video selfie in inputs/mio_selfie.mp4")
+
+    videos, photos = discover_input_media(INPUT_DIR)
+    _test_stats["videos_found"] = len(videos)
+    _test_stats["photos_found"] = len(photos)
+
+    logger.info(f"Scansione {INPUT_DIR}/:")
+    logger.info(f"  Video trovati: {len(videos)}")
+    for v in videos:
+        logger.info(f"    - {v.relative_to(INPUT_DIR)} ({v.stat().st_size / 1024 / 1024:.2f} MB)")
+    logger.info(f"  Foto trovate: {len(photos)}")
+    for p in photos:
+        logger.info(f"    - {p.relative_to(INPUT_DIR)}")
+
+    if not videos and not photos:
+        logger.error("ERRORE: Nessun video o foto trovato in inputs/")
+        logger.info("Caricare materiale in inputs/Soggetto 1/ (*.jpg, *.avi)")
         return False
-    
-    logger.info(f"✓ Video selfie trovato: {INPUT_VIDEO}")
-    logger.info(f"  Dimensione: {INPUT_VIDEO.stat().st_size / 1024 / 1024:.2f} MB")
-    
-    # Crea directory temporanea per faces
+
+    if not check_prerequisites():
+        return False
+
+    if TEMP_FACES_DIR.exists():
+        safe_rmtree(TEMP_FACES_DIR)
     TEMP_FACES_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info(f"✓ Directory temporanea creata: {TEMP_FACES_DIR}")
-    
-    # Crea directory output
+    logger.info(f"✓ Directory reference creata: {TEMP_FACES_DIR.resolve()}")
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     logger.info(f"✓ Directory output creata: {OUTPUT_DIR}")
-    
+
     elapsed = time.time() - start_time
     logger.info(f"Setup completato in {elapsed:.2f}s")
-    
     return True
 
 
 async def fase1_ingestione_biometrica() -> bool:
-    """
-    Fase 1: Estrazione fotogrammi biometrici dal video selfie
-    """
+    """Extract frames from all videos and copy all photos into reference dir."""
     logger.info("")
-    logger.info("="*70)
-    logger.info("FASE 1 - INGESTIONE BIOMETRICA")
-    logger.info("="*70)
-    
+    logger.info("=" * 70)
+    logger.info("FASE 1 - INGESTIONE BIOMETRICA (SOLO SOGGETTO 1)")
+    logger.info("=" * 70)
+
     start_time = time.time()
-    
+    videos, photos = discover_input_media(INPUT_DIR)
+    total_frames = 0
+
     try:
-        # Estrai 5 frame nitidi dal video selfie usando la funzione corretta
-        logger.info(f"Estrazione frame da: {INPUT_VIDEO}")
-        logger.info(f"Target: 5 frame con diversi angoli di ripresa")
-        logger.info(f"Algoritmo: Laplacian variance + solvePnP per Euler angles")
-        
-        frame_data = extract_and_save_frames_for_identity(
-            video_path=str(INPUT_VIDEO),
-            output_dir=str(TEMP_FACES_DIR),
-            num_frames=5,
-            laplacian_threshold=100.0
-        )
-        
-        logger.info(f"✓ Estratti {len(frame_data)} frame biometrici")
+        for video in videos:
+            prefix = _sanitize_prefix(video.stem)
+            logger.info(f"Estrazione frame da: {video.relative_to(INPUT_DIR)}")
+            logger.info(f"  Prefix: {prefix} | Target: {FRAMES_PER_VIDEO} frame")
+
+            try:
+                frame_data = extract_and_save_frames_for_identity(
+                    video_path=str(video.resolve()),
+                    output_dir=get_reference_faces_dir(),
+                    num_frames=FRAMES_PER_VIDEO,
+                    laplacian_threshold=LAPLACIAN_THRESHOLD,
+                    filename_prefix=prefix,
+                )
+            except ValueError as e:
+                logger.warning(f"  ⚠ Estrazione fallita per {video.name}: {e}")
+                continue
+
+            total_frames += len(frame_data)
+            logger.info(f"  ✓ Estratti {len(frame_data)} frame da {video.name}")
+            for i, data in enumerate(frame_data, 1):
+                angles = data["angles"]
+                logger.info(
+                    f"    Frame {i}: {Path(data['path']).name} "
+                    f"(Yaw={angles[0]:.1f}°, Pitch={angles[1]:.1f}°, Roll={angles[2]:.1f}°)"
+                )
+
+        if photos:
+            logger.info(f"Copia {len(photos)} foto di riferimento in {TEMP_FACES_DIR}")
+            copied = copy_photos_to_reference(photos, TEMP_FACES_DIR)
+            _test_stats["photos_copied"] = copied
+            logger.info(f"✓ {copied} foto disponibili come reference aggiuntive")
+
+        reference_files = [
+            p for p in TEMP_FACES_DIR.iterdir() if p.is_file()
+        ]
+        _test_stats["frames_extracted"] = total_frames
+
+        if not reference_files:
+            logger.error("ERRORE: Nessun file di reference generato")
+            return False
+
         logger.info("")
-        logger.info("Dettagli frame estratti:")
-        for i, data in enumerate(frame_data, 1):
-            angles = data['angles']
-            lap_var = data['laplacian_variance']
-            logger.info(f"  Frame {i}: {Path(data['path']).name}")
-            logger.info(f"    Yaw: {angles[0]:7.2f}°  |  Pitch: {angles[1]:7.2f}°  |  Roll: {angles[2]:7.2f}°")
-            logger.info(f"    Sharpness (Laplacian): {lap_var:.2f}")
-        
+        logger.info(f"Reference set unificato (subject_1): {len(reference_files)} file totali")
+        logger.info(f"  - Frame estratti da video: {total_frames}")
+        logger.info(f"  - Foto copiate: {_test_stats['photos_copied']}")
+
         elapsed = time.time() - start_time
-        logger.info("")
         logger.info(f"Fase 1 completata in {elapsed:.2f}s")
-        
         return True
-        
+
     except FileNotFoundError as e:
-        logger.error(f"ERRORE Fase 1: Video non trovato - {e}")
+        logger.error(f"ERRORE Fase 1: File non trovato - {e}")
         return False
     except ValueError as e:
         logger.error(f"ERRORE Fase 1: Video non valido o corrotto - {e}")
@@ -151,70 +282,108 @@ async def fase1_ingestione_biometrica() -> bool:
         return False
 
 
-async def fase2_orchestrazione() -> Optional[Dict[str, Any]]:
-    """
-    Fase 2: Innesco orchestratore con Dynamic Retrieval
-    """
-    logger.info("")
-    logger.info("="*70)
-    logger.info("FASE 2 - ORCHESTRAZIONE VIDEO")
-    logger.info("="*70)
-    
-    start_time = time.time()
-    
+async def _resolve_motion_reference(motion_keyword: str) -> Optional[str]:
+    """Try to retrieve motion reference via Dynamic Retriever (optional)."""
     try:
-        # Parametri generazione
-        prompt = "A professional olympic diver performing a perfect triple somersault, cinematic lighting, 4k resolution, photorealistic"
-        duration = 5
-        
+        from dynamic_retriever import retrieve_motion_reference
+
+        logger.info(f"Dynamic Retriever: ricerca motion reference per '{motion_keyword}'")
+        motion_path = await retrieve_motion_reference(motion_keyword, max_duration=E2E_DURATION_SECONDS)
+        logger.info(f"✓ Motion reference: {motion_path}")
+        return motion_path
+    except Exception as e:
+        logger.warning(f"Dynamic Retriever non disponibile o fallito: {e}")
+        logger.info("Proseguo senza motion reference (solo prompt testuale)")
+        return None
+
+
+async def fase2_orchestrazione() -> Optional[Dict[str, Any]]:
+    """Trigger orchestrator with unified reference set."""
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("FASE 2 - ORCHESTRAZIONE VIDEO")
+    logger.info("=" * 70)
+
+    start_time = time.time()
+
+    try:
+        subjects_payload = {"subject_1": get_reference_faces_dir()}
+
         logger.info("Parametri generazione:")
-        logger.info(f"  Prompt: {prompt}")
-        logger.info(f"  Duration: {duration}s")
-        logger.info(f"  Reference faces: {TEMP_FACES_DIR}")
+        logger.info(f"  Prompt: {E2E_PROMPT}")
+        logger.info(f"  Motion keyword: {E2E_MOTION_KEYWORD}")
+        logger.info(f"  Duration: {E2E_DURATION_SECONDS}s")
+        logger.info(f"  Subjects payload: {subjects_payload}")
         logger.info("")
-        logger.info("Pipeline attiva:")
-        logger.info("  1. Multi-angle identity extraction (5 angoli)")
-        logger.info("  2. Identity super-vector fusion")
-        logger.info("  3. High-fidelity first frame (Flux.1 Dev)")
-        logger.info("  4. Image-to-Video (Wan I2V)")
-        logger.info("  5. Identity consistency enforcement")
-        logger.info("")
-        
-        # Invoca core engine
-        logger.info("Avvio generazione video...")
-        logger.info("(Questa operazione può richiedere 2-5 minuti)")
-        logger.info("")
-        
-        result = await generate_high_fidelity_video(
-            reference_faces_dir=str(TEMP_FACES_DIR),
-            prompt=prompt,
-            duration_seconds=duration,
-            output_path=str(OUTPUT_DIR)
+
+        controlnet_map_path = await _resolve_motion_reference(E2E_MOTION_KEYWORD)
+        _test_stats["motion_reference_path"] = controlnet_map_path
+
+        logger.info("Config Core Engine (autoregressivo):")
+        logger.info(f"  enable_autoregressive: {E2E_ENABLE_AUTOREGRESSIVE}")
+        logger.info(f"  segment_duration: {E2E_SEGMENT_DURATION}s")
+        expected_segments = int(E2E_DURATION_SECONDS / E2E_SEGMENT_DURATION)
+        if E2E_DURATION_SECONDS > E2E_SEGMENT_DURATION:
+            expected_segments = max(2, -(-E2E_DURATION_SECONDS // E2E_SEGMENT_DURATION))
+        logger.info(f"  segmenti attesi (~): {expected_segments}")
+        eta_low, eta_high = estimate_pipeline_seconds(
+            E2E_DURATION_SECONDS,
+            draft_mode=False,
+            autoregressive=E2E_ENABLE_AUTOREGRESSIVE,
+            segment_duration=E2E_SEGMENT_DURATION,
         )
-        
+        logger.info(f"  Tempo stimato totale: {format_eta_range(eta_low, eta_high)}")
         logger.info("")
-        logger.info("✓ Video generato con successo!")
+        logger.info("Avvio generazione video...")
+        logger.info("(Countdown [ETA] visibile ogni ~12s durante Flux/I2V)")
+        logger.info("")
+
+        engine_config = CoreEngineConfig(
+            reference_faces_dir=get_reference_faces_dir(),
+            num_angles=5,
+            duration_seconds=E2E_DURATION_SECONDS,
+            output_path=str(OUTPUT_DIR),
+            controlnet_map_path=controlnet_map_path,
+            quality_preset=QualityPreset.HIGH,
+            enable_autoregressive=E2E_ENABLE_AUTOREGRESSIVE,
+            segment_duration=E2E_SEGMENT_DURATION,
+        )
+        engine = CoreEngine(config=engine_config)
+        gen_result = await engine.generate_high_fidelity_video(
+            reference_faces_dir=get_reference_faces_dir(),
+            prompt=E2E_PROMPT,
+            controlnet_map_path=controlnet_map_path,
+            duration_seconds=E2E_DURATION_SECONDS,
+            output_path=str(OUTPUT_DIR),
+        )
+        result = {
+            "video_url": gen_result.final_video_url,
+            "duration": gen_result.duration_seconds,
+            "identity_stability": gen_result.identity_stability_score,
+            "temporal_consistency": gen_result.temporal_consistency_score,
+            "generation_time": gen_result.total_generation_time,
+            "num_segments": gen_result.num_segments,
+            "autoregressive_used": gen_result.metadata.get("autoregressive_used", False),
+        }
+
+        logger.info("")
+        logger.info("V Video generato con successo!")
         logger.info("")
         logger.info("Risultati generazione:")
         logger.info(f"  Video URL/Path: {result.get('video_url', 'N/A')}")
         logger.info(f"  Duration: {result.get('duration', 0)}s")
-        logger.info(f"  Identity stability: {result.get('identity_stability', 0)*100:.1f}%")
-        logger.info(f"  Temporal consistency: {result.get('temporal_consistency', 0)*100:.1f}%")
+        logger.info(f"  Num segments: {result.get('num_segments', 'N/A')}")
+        logger.info(f"  Autoregressive: {result.get('autoregressive_used', False)}")
+        logger.info(f"  Identity stability: {result.get('identity_stability', 0) * 100:.1f}%")
+        logger.info(f"  Temporal consistency: {result.get('temporal_consistency', 0) * 100:.1f}%")
         logger.info(f"  Generation time: {result.get('generation_time', 0):.2f}s")
-        
+
         elapsed = time.time() - start_time
-        logger.info("")
         logger.info(f"Fase 2 completata in {elapsed:.2f}s")
-        
         return result
-        
+
     except RuntimeError as e:
         logger.error(f"ERRORE Fase 2: {e}")
-        logger.error("")
-        logger.error("Possibili cause:")
-        logger.error("  - API key non configurata (FAL_KEY in .env)")
-        logger.error("  - Servizi esterni non disponibili")
-        logger.error("  - Timeout di rete")
         import traceback
         logger.error(traceback.format_exc())
         return None
@@ -226,52 +395,32 @@ async def fase2_orchestrazione() -> Optional[Dict[str, Any]]:
 
 
 async def fase3_teardown(result: Optional[Dict[str, Any]]) -> bool:
-    """
-    Fase 3: Cleanup GDPR-compliant
-    """
+    """GDPR-compliant cleanup."""
     logger.info("")
-    logger.info("="*70)
+    logger.info("=" * 70)
     logger.info("FASE 3 - TEARDOWN GDPR-COMPLIANT")
-    logger.info("="*70)
-    
+    logger.info("=" * 70)
+
     start_time = time.time()
-    
+
     try:
-        # Stampa risultato finale
         if result:
             logger.info("Risultato finale:")
             logger.info(f"  Video URL/Path: {result.get('video_url', 'N/A')}")
             logger.info(f"  Duration: {result.get('duration', 0)}s")
-            logger.info(f"  Quality metrics:")
-            logger.info(f"    - Identity stability: {result.get('identity_stability', 0)*100:.1f}%")
-            logger.info(f"    - Temporal consistency: {result.get('temporal_consistency', 0)*100:.1f}%")
-            logger.info("")
-        
-        # Distruzione dati biometrici temporanei
+
         logger.info(f"Rimozione dati biometrici: {TEMP_FACES_DIR}")
-        
+
         if TEMP_FACES_DIR.exists():
-            # Conta file prima della rimozione
-            files_to_remove = list(TEMP_FACES_DIR.glob("*"))
-            num_files = len(files_to_remove)
-            
+            num_files = len(list(TEMP_FACES_DIR.glob("*")))
             logger.info(f"  File da rimuovere: {num_files}")
-            
-            # Rimozione sicura
-            shutil.rmtree(TEMP_FACES_DIR)
+            safe_rmtree(TEMP_FACES_DIR)
             logger.info("✓ Dati biometrici rimossi (GDPR compliance)")
-            logger.info("")
-            logger.info("Note GDPR:")
-            logger.info("  - Dati biometrici temporanei eliminati")
-            logger.info("  - Solo il video finale è conservato in outputs/")
-            logger.info("  - Il video sorgente rimane in inputs/ (sotto controllo utente)")
-        
+
         elapsed = time.time() - start_time
-        logger.info("")
         logger.info(f"Fase 3 completata in {elapsed:.2f}s")
-        
         return True
-        
+
     except Exception as e:
         logger.error(f"ERRORE Fase 3: {type(e).__name__}: {e}")
         import traceback
@@ -279,74 +428,61 @@ async def fase3_teardown(result: Optional[Dict[str, Any]]) -> bool:
         return False
 
 
+def print_final_report(result: Optional[Dict[str, Any]], total_elapsed: float) -> None:
+    """Print structured E2E report."""
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("REPORT E2E")
+    logger.info("=" * 70)
+    logger.info(f"Video processati:     {_test_stats['videos_found']}")
+    logger.info(f"Foto processate:      {_test_stats['photos_found']} (copiate: {_test_stats['photos_copied']})")
+    logger.info(f"Frame estratti:       {_test_stats['frames_extracted']}")
+    logger.info(f"Motion reference:     {_test_stats['motion_reference_path'] or 'N/A'}")
+    logger.info(f"Tempo totale:         {total_elapsed:.2f}s")
+
+    if result:
+        video_path = result.get("video_url", "N/A")
+        logger.info(f"Esito:                PASSED")
+        logger.info(f"Segmenti:             {result.get('num_segments', 'N/A')}")
+        logger.info(f"Autoregressivo:       {result.get('autoregressive_used', False)}")
+        logger.info(f"Output video:         {video_path}")
+    else:
+        logger.info("Esito:                FAILED")
+        logger.info("Output video:         N/A")
+
+
 async def main() -> bool:
-    """
-    Main E2E test runner
-    """
+    """Main E2E test runner."""
     logger.info("")
-    logger.info("#"*70)
+    logger.info("#" * 70)
     logger.info("# END-TO-END KINEMATIC INTEGRATION TEST")
-    logger.info("#"*70)
+    logger.info("#" * 70)
     logger.info("")
-    logger.info("Questo test valida l'intero stack architetturale:")
-    logger.info("  - Ingestione biometrica (OpenCV)")
-    logger.info("  - Orchestrazione video (Core Engine)")
-    logger.info("  - Dynamic Kinematic Retrieval")
-    logger.info("  - GDPR compliance (data destruction)")
-    logger.info("")
-    
+
     total_start = time.time()
-    
-    # Setup
+
     if not await setup_phase():
-        logger.error("")
-        logger.error("Setup fallito - terminazione test")
+        print_final_report(None, time.time() - total_start)
         return False
-    
-    # Fase 1: Biometria
+
     if not await fase1_ingestione_biometrica():
-        logger.error("")
-        logger.error("Fase 1 fallita - terminazione test")
-        await fase3_teardown(None)  # Cleanup parziale
+        await fase3_teardown(None)
+        print_final_report(None, time.time() - total_start)
         return False
-    
-    # Fase 2: Orchestrazione
+
     result = await fase2_orchestrazione()
-    if not result:
-        logger.error("")
-        logger.error("Fase 2 fallita - continuo con teardown")
-        # Continua comunque con teardown
-    
-    # Fase 3: Teardown
     await fase3_teardown(result)
-    
-    # Summary
+
     total_elapsed = time.time() - total_start
+    print_final_report(result, total_elapsed)
+
     logger.info("")
-    logger.info("="*70)
-    logger.info("E2E TEST COMPLETATO")
-    logger.info("="*70)
-    logger.info(f"Tempo totale: {total_elapsed:.2f}s")
-    logger.info(f"Log salvato in: e2e_test.log")
-    logger.info("")
-    
     if result:
         logger.info("✓✓✓ Test PASSED ✓✓✓")
-        logger.info("")
-        logger.info("Il sistema funziona correttamente end-to-end.")
-        logger.info(f"Video finale disponibile in: {OUTPUT_DIR}")
-        logger.info("")
         return True
-    else:
-        logger.error("✗✗✗ Test FAILED ✗✗✗")
-        logger.error("")
-        logger.error("Controllare i log sopra per dettagli sull'errore.")
-        logger.error("Verificare:")
-        logger.error("  1. FAL_KEY configurata in .env")
-        logger.error("  2. Connessione internet attiva")
-        logger.error("  3. Video selfie valido in inputs/")
-        logger.error("")
-        return False
+
+    logger.error("✗✗✗ Test FAILED ✗✗✗")
+    return False
 
 
 if __name__ == "__main__":
@@ -354,18 +490,11 @@ if __name__ == "__main__":
         success = asyncio.run(main())
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
-        logger.info("")
         logger.warning("Test interrotto dall'utente (Ctrl+C)")
-        logger.info("Cleanup in corso...")
-        
-        # Cleanup veloce su interruzione
         if TEMP_FACES_DIR.exists():
-            shutil.rmtree(TEMP_FACES_DIR)
-            logger.info("✓ Dati temporanei rimossi")
-        
+            safe_rmtree(TEMP_FACES_DIR)
         sys.exit(130)
     except Exception as e:
-        logger.error("")
         logger.error(f"ERRORE CRITICO: {type(e).__name__}: {e}")
         import traceback
         logger.error(traceback.format_exc())

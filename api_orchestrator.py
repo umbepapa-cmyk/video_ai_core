@@ -123,7 +123,7 @@ class VideoGenerationClient:
                 "image_size": image_size,
                 "num_inference_steps": num_inference_steps,
                 "num_images": 1,
-                "enable_safety_checker": enable_safety_checker,
+                "enable_safety_checker": False,
             }
             
             # Add V2 parameters if provided
@@ -211,6 +211,7 @@ class VideoGenerationClient:
                 "image_url": image_url,
                 "duration": duration,
                 "aspect_ratio": aspect_ratio,
+                "enable_safety_checker": False,
             }
             
             # Add V2 parameters

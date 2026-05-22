@@ -18,6 +18,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
 import asyncio
+import shutil
 import subprocess
 import tempfile
 
@@ -205,7 +206,7 @@ class GlobalNoiseSeedManager:
         Args:
             base_seed: Base seed for noise generation
         """
-        self.base_seed = base_seed or np.random.randint(0, 2**32 - 1)
+        self.base_seed = base_seed or int(np.random.randint(0, np.iinfo(np.int32).max))
         self.segment_seeds: Dict[int, int] = {}
         
         logger.info(f"GlobalNoiseSeedManager initialized (base_seed={self.base_seed})")
@@ -436,6 +437,7 @@ class AutoregressiveV2Engine:
             # Generate segment
             segment = await self._generate_segment(
                 segment_id=i,
+                num_segments=num_segments,
                 prompt=prompt,
                 current_frame_url=current_frame_url,
                 identity_vector=identity_vector,
@@ -494,6 +496,7 @@ class AutoregressiveV2Engine:
     async def _generate_segment(
         self,
         segment_id: int,
+        num_segments: int,
         prompt: str,
         current_frame_url: str,
         identity_vector: np.ndarray,
@@ -521,7 +524,9 @@ class AutoregressiveV2Engine:
             "identity_vector": identity_vector,
             "negative_prompt": negative_prompt,
             "duration_seconds": self.config.segment_duration_seconds,
-            "seed": seed
+            "seed": seed,
+            "segment_index": segment_id,
+            "num_segments": num_segments,
         }
         
         # Generate video (mock for now)
@@ -532,6 +537,24 @@ class AutoregressiveV2Engine:
             await asyncio.sleep(1)
             video_url = f"https://example.com/segment_{segment_id}.mp4"
             last_frame_url = f"https://example.com/segment_{segment_id}_last_frame.jpg"
+        
+        if not last_frame_url:
+            raise RuntimeError(
+                f"Segment {segment_id + 1}: last_frame_url is missing after generation. "
+                "Cannot propagate first frame to the next autoregressive segment."
+            )
+        
+        if segment_id > 0 and not current_frame_url:
+            raise RuntimeError(
+                f"Segment {segment_id + 1}: first_frame_url was not propagated "
+                f"from segment {segment_id} (got None/empty)."
+            )
+        
+        logger.info(
+            "Segment %s last_frame_url ready for propagation: %s",
+            segment_id + 1,
+            last_frame_url[:80] + "..." if len(last_frame_url) > 80 else last_frame_url,
+        )
         
         # Calculate identity drift (mock)
         identity_drift = np.random.rand() * 0.05  # Mock drift < 5%
@@ -552,6 +575,43 @@ class AutoregressiveV2Engine:
         
         return segment
     
+    def _merge_videos_opencv(self, video_paths: List[str], output_path: Path) -> None:
+        """Concatenate videos with OpenCV when FFmpeg is unavailable."""
+        import cv2
+
+        writer = None
+        fps = 24.0
+        size: Optional[Tuple[int, int]] = None
+
+        for path in video_paths:
+            capture = cv2.VideoCapture(path)
+            if not capture.isOpened():
+                raise RuntimeError(f"OpenCV could not open video: {path}")
+
+            vfps = capture.get(cv2.CAP_PROP_FPS) or fps
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            if writer is None:
+                fps = vfps
+                size = (width, height)
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(output_path), fourcc, fps, size)
+
+            while True:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    break
+                if size and (frame.shape[1], frame.shape[0]) != size:
+                    frame = cv2.resize(frame, size)
+                writer.write(frame)
+            capture.release()
+
+        if writer:
+            writer.release()
+        else:
+            raise RuntimeError("No frames written during OpenCV merge")
+
     async def _merge_segments(self, segments: List[VideoSegment]) -> str:
         """
         Merge video segments with FFmpeg.
@@ -617,35 +677,39 @@ class AutoregressiveV2Engine:
             
             # Output file
             output_path = temp_dir / "merged_output.mp4"
-            
-            # FFmpeg command for concatenation
-            # Using concat demuxer for lossless concatenation
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_file),
-                "-c", "copy",  # Copy codec (lossless)
-                "-y",  # Overwrite output
-                str(output_path)
-            ]
-            
-            logger.info("Running FFmpeg concatenation...")
-            logger.debug(f"Command: {' '.join(ffmpeg_cmd)}")
-            
-            # Run FFmpeg
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                error_msg = stderr.decode('utf-8', errors='ignore')
-                logger.error(f"FFmpeg failed: {error_msg}")
-                raise RuntimeError(f"FFmpeg concatenation failed: {error_msg}")
+
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if not ffmpeg_bin:
+                logger.warning("FFmpeg not found — merging segments with OpenCV")
+                self._merge_videos_opencv(local_videos, output_path)
+            else:
+                # FFmpeg command for concatenation
+                # Using concat demuxer for lossless concatenation
+                ffmpeg_cmd = [
+                    ffmpeg_bin,
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", str(concat_file),
+                    "-c", "copy",  # Copy codec (lossless)
+                    "-y",  # Overwrite output
+                    str(output_path)
+                ]
+
+                logger.info("Running FFmpeg concatenation...")
+                logger.debug(f"Command: {' '.join(ffmpeg_cmd)}")
+
+                process = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                stdout, stderr = await process.communicate()
+
+                if process.returncode != 0:
+                    error_msg = stderr.decode('utf-8', errors='ignore')
+                    logger.error(f"FFmpeg failed: {error_msg}")
+                    raise RuntimeError(f"FFmpeg concatenation failed: {error_msg}")
             
             # Verify output exists
             if not output_path.exists():

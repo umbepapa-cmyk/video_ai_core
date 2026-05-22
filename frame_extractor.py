@@ -11,7 +11,7 @@ This module implements:
 
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import logging
@@ -329,7 +329,8 @@ def extract_and_save_frames_for_identity(
     video_path: str,
     output_dir: str,
     num_frames: int = 5,
-    laplacian_threshold: float = 100.0
+    laplacian_threshold: float = 100.0,
+    filename_prefix: str = ""
 ) -> List[Dict[str, Any]]:
     """
     WEEK 1 V2: Extract frames and save for multi-angle identity locking.
@@ -342,6 +343,7 @@ def extract_and_save_frames_for_identity(
         output_dir: Directory to save extracted frames
         num_frames: Number of frames to extract (default: 5 for multi-angle)
         laplacian_threshold: Minimum Laplacian variance for sharp frames
+        filename_prefix: Optional prefix for saved frame filenames (avoids collisions)
         
     Returns:
         List of frame metadata dictionaries with:
@@ -353,12 +355,12 @@ def extract_and_save_frames_for_identity(
     import cv2
     from pathlib import Path
     
-    # Create output directory
-    output_path = Path(output_dir)
+    # Create output directory (absolute path for cross-module consistency on Windows)
+    output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
     
     logger.info(f"Extracting {num_frames} frames for multi-angle identity lock")
-    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Output directory: {output_path}")
     
     # Extract frames
     extractor = FrameExtractor(laplacian_threshold=laplacian_threshold)
@@ -369,14 +371,15 @@ def extract_and_save_frames_for_identity(
     
     for i, frame in enumerate(frames):
         # Save frame image
-        frame_filename = f"frame_{i:03d}_yaw{frame.euler_angles[0]:.1f}.jpg"
-        frame_path = output_path / frame_filename
+        prefix = f"{filename_prefix}_" if filename_prefix else ""
+        frame_filename = f"{prefix}frame_{i:03d}_yaw{frame.euler_angles[0]:.1f}.jpg"
+        frame_path = (output_path / frame_filename).resolve()
         
         cv2.imwrite(str(frame_path), frame.image)
         
         # Create metadata
         metadata = {
-            'path': str(frame_path),
+            'path': str(frame_path.resolve()),
             'angles': frame.euler_angles,
             'frame_number': frame.frame_number,
             'laplacian_variance': frame.laplacian_variance,

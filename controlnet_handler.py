@@ -12,7 +12,7 @@ This module implements:
 
 import os
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from pathlib import Path
 from dataclasses import dataclass
 from enum import Enum
@@ -376,7 +376,7 @@ class ControlNetHandler:
                 arguments=payload
             )
             
-            result_data = await handler.get(timeout=120)
+            result_data = await asyncio.wait_for(handler.get(), timeout=120)
             
             images = result_data.get("images", [])
             if not images:

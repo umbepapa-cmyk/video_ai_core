@@ -362,108 +362,112 @@ class AnimateDiffEngine:
         Returns:
             Tuple of (video_url, metadata)
         """
-        logger.info("Calling Wan I2V API for AnimateDiff-style generation...")
-        
-        if not fal_client:
-            raise RuntimeError("fal_client not available. Install with: pip install fal-client")
-        
+        logger.info("Calling I2V fallback router for AnimateDiff-style generation...")
+
         if not self.api_key:
             raise ValueError("FAL_KEY not set in environment")
-        
-        # Map motion preset to motion strength
-        motion_strength_map = {
-            "static": 0.2,
-            "subtle": 0.4,
-            "smooth": 0.6,
-            "cinematic": 0.8,
-            "dynamic": 1.0,
-            "custom": payload.get("motion_scale", 0.6)
-        }
-        
+
+        from i2v_router import generate_i2v_with_fallback, motion_strength_for_preset
+
         motion_preset = payload.get("motion_preset", "cinematic")
-        motion_strength = motion_strength_map.get(motion_preset, 0.6)
-        
-        # Prepare Fal.ai Wan I2V payload
-        api_payload = {
-            "image_url": payload.get("first_frame_url"),
-            "prompt": payload.get("prompt", ""),
-            "duration": min(int(payload.get("duration_seconds", 5)), 10),  # Max 10s
-            "fps": payload.get("fps", 24),
-            "resolution": "720p",
-            "motion_strength": motion_strength,
-            "seed": -1,  # Random
-            "enable_loop": False,
-        }
-        
-        # Add negative prompt if available
-        if payload.get("negative_prompt"):
-            api_payload["negative_prompt"] = payload["negative_prompt"]
-        
-        # Define the actual API call as a nested async function for retry
+        duration_seconds = float(payload.get("duration_seconds", 5))
+        fps = int(payload.get("fps", 24))
+        resolution = payload.get("resolution", "720p")
+        timeout_multiplier = float(payload.get("timeout_multiplier", 1.0))
+        draft_mode = bool(payload.get("draft_mode", resolution == "480p"))
+        require_last_frame = bool(payload.get("require_last_frame", True))
+        motion_strength = motion_strength_for_preset(
+            motion_preset, payload.get("motion_scale", 0.6)
+        )
+        stage_label = payload.get("stage_label", "Generazione video")
+        segment_index = int(payload.get("segment_index", 1))
+        segment_total = int(payload.get("segment_total", 1))
+        on_progress = payload.get("on_progress")
+
         async def _api_call():
-            logger.info(f"Submitting to Fal.ai Wan I2V...")
-            logger.info(f"  Image: {api_payload['image_url']}")
-            logger.info(f"  Duration: {api_payload['duration']}s")
-            logger.info(f"  Motion: {motion_preset} (strength: {motion_strength})")
-            
-            # Submit async job
             import time
+
             start_time = time.time()
-            
-            handler = await fal_client.submit_async(
-                "fal-ai/wan-v2.2-i2v",
-                arguments=api_payload
+            logger.info("Submitting via I2V fallback router...")
+            logger.info(f"  Image: {payload.get('first_frame_url')}")
+            logger.info(f"  Duration: {duration_seconds}s")
+            logger.info(f"  Motion: {motion_preset} (strength: {motion_strength})")
+            logger.info(f"  Resolution: {resolution}")
+
+            id_raw = payload.get("identity_vector")
+            identity_arr: Optional[np.ndarray] = None
+            if id_raw is not None:
+                identity_arr = (
+                    id_raw
+                    if isinstance(id_raw, np.ndarray)
+                    else np.asarray(id_raw, dtype=np.float32)
+                )
+
+            result = await generate_i2v_with_fallback(
+                image_url=payload.get("first_frame_url"),
+                prompt=payload.get("prompt", ""),
+                duration=duration_seconds,
+                negative_prompt=payload.get("negative_prompt", ""),
+                motion_preset=motion_preset,
+                fps=fps,
+                resolution=resolution,
+                timeout_multiplier=timeout_multiplier,
+                draft_mode=draft_mode,
+                require_last_frame=require_last_frame,
+                api_key=self.api_key,
+                stage_label=stage_label,
+                segment_index=segment_index,
+                segment_total=segment_total,
+                on_progress=on_progress,
+                identity_vector=identity_arr,
+                identity_adapter_strength=float(
+                    payload.get("identity_adapter_strength", 0.95)
+                ),
+                controlnet_video_url=payload.get("controlnet_video_url"),
+                pose_map_url=payload.get("pose_map_url"),
+                num_inference_steps=payload.get("num_inference_steps"),
             )
-            
-            # Wait for completion with timeout
-            logger.info("Waiting for video generation (timeout: 300s)...")
-            result = await handler.get(timeout=300)
-            
+
             generation_time = time.time() - start_time
-            
-            # Extract video URL
-            video_data = result.get("video", {})
-            video_url = video_data.get("url")
-            if not video_url:
-                raise ValueError("Video URL not found in API response")
-            
-            # Extract last frame URL
-            last_frame_data = result.get("last_frame", {})
-            last_frame_url = last_frame_data.get("url")
-            
-            # Build metadata
+            video_url = result["video_url"]
+            last_frame_url = result.get("last_frame_url")
+            if not last_frame_url and require_last_frame:
+                from i2v_router import ensure_last_frame_url
+
+                last_frame_url = await ensure_last_frame_url(
+                    video_url, None, self.api_key
+                )
             metadata = {
-                "model": "wan-v2.2-i2v",
+                "model": result.get("provider_id", "i2v-fallback"),
+                "endpoint": result.get("endpoint_id"),
                 "motion_preset": motion_preset,
                 "motion_strength": motion_strength,
                 "temporal_consistency": payload.get("temporal_consistency"),
                 "identity_locked": "identity_vector" in payload,
                 "last_frame_url": last_frame_url,
                 "generation_time_seconds": generation_time,
-                "resolution": api_payload["resolution"],
-                "fps": api_payload["fps"],
-                "duration": api_payload["duration"]
+                "resolution": resolution,
+                "fps": fps,
+                "duration": duration_seconds,
             }
-            
-            logger.info(f"✓ Video generation complete ({generation_time:.1f}s)")
+
+            logger.info(f"Video generation complete ({generation_time:.1f}s)")
             logger.info(f"  Video URL: {video_url}")
             if last_frame_url:
                 logger.info(f"  Last frame: {last_frame_url}")
-            
+
             return video_url, metadata
-        
-        # Execute with retry logic
+
         try:
             import httpx
-            result = await retry_with_backoff(
+
+            return await retry_with_backoff(
                 _api_call,
-                max_retries=3,
-                initial_delay=5.0,  # Longer initial delay for video generation
+                max_retries=1,
+                initial_delay=5.0,
                 backoff_factor=2.0,
-                exceptions=(httpx.HTTPError, asyncio.TimeoutError, ValueError, RuntimeError)
+                exceptions=(httpx.HTTPError, ValueError, RuntimeError),
             )
-            return result
-            
         except Exception as e:
             logger.error(f"AnimateDiff API call failed after all retries: {type(e).__name__}: {e}")
             raise RuntimeError(f"AnimateDiff API call failed: {e}") from e

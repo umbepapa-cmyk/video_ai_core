@@ -16,6 +16,7 @@ Reference Faces → Identity Lock → ControlNet → AnimateDiff → Autoregress
 
 import os
 import logging
+import shutil
 from typing import Optional, Dict, Any, List, Callable, Tuple
 from pathlib import Path
 from dataclasses import dataclass
@@ -36,8 +37,25 @@ from path_config import (
     CARTELLA_VOLTI_RIFERIMENTO_TEST
 )
 
+from identity_cache import (
+    compute_folder_hash,
+    load_cached_identity,
+    save_cached_identity,
+)
+
 # Import custom exceptions
-from exceptions import KinematicMismatchError
+from exceptions import KinematicMismatchError, BudgetExceededError
+
+from cost_estimator import estimate_pipeline_cost
+from budget_tracker import check_budget, record_spend
+
+from generation_progress import (
+    ProgressCallback,
+    estimate_first_frame_seconds,
+    estimate_pipeline_seconds,
+    format_eta_range,
+    submit_and_wait_with_eta,
+)
 
 try:
     import fal_client
@@ -71,6 +89,67 @@ class QualityPreset(Enum):
     STANDARD = "standard"
     HIGH = "high"
     ULTRA = "ultra"
+
+
+# Preset tuning: Flux first-frame steps, I2V resolution/steps, timeouts.
+# STANDARD/HIGH/MID enforce >= 20 inference steps; DRAFT stays low for dry-runs.
+PRESET_TUNING: Dict[QualityPreset, Dict[str, Any]] = {
+    QualityPreset.DRAFT: {
+        "flux_steps": 12,
+        "i2v_steps": 12,
+        "resolution": "480p",
+        "image_size": {"width": 512, "height": 512},
+        "first_frame_timeout": 90,
+        "i2v_timeout_multiplier": 0.5,
+        "guidance_scale": 5.0,
+    },
+    QualityPreset.STANDARD: {
+        "flux_steps": 25,
+        "i2v_steps": 25,
+        "resolution": "720p",
+        "image_size": "landscape_16_9",
+        "first_frame_timeout": 120,
+        "i2v_timeout_multiplier": 0.75,
+        "guidance_scale": 6.5,
+    },
+    QualityPreset.HIGH: {
+        "flux_steps": 28,
+        "i2v_steps": 28,
+        "resolution": "720p",
+        "image_size": "landscape_16_9",
+        "first_frame_timeout": 120,
+        "i2v_timeout_multiplier": 1.0,
+        "guidance_scale": 7.5,
+    },
+    QualityPreset.ULTRA: {
+        "flux_steps": 35,
+        "i2v_steps": 35,
+        "resolution": "720p",
+        "image_size": "landscape_16_9",
+        "first_frame_timeout": 180,
+        "i2v_timeout_multiplier": 1.0,
+        "guidance_scale": 8.0,
+    },
+}
+
+
+def get_preset_tuning(preset: QualityPreset) -> Dict[str, Any]:
+    """Return a copy of preset tuning with non-DRAFT step floors enforced."""
+    tuning = dict(PRESET_TUNING.get(preset, PRESET_TUNING[QualityPreset.HIGH]))
+    if preset != QualityPreset.DRAFT:
+        tuning["flux_steps"] = max(20, int(tuning["flux_steps"]))
+        tuning["i2v_steps"] = max(20, int(tuning["i2v_steps"]))
+    return tuning
+
+
+def _resolve_dir_path(path: str) -> str:
+    """Normalize directory path to absolute resolved string (Windows-safe)."""
+    return str(Path(path).resolve())
+
+
+def _normalize_subjects_payload(subjects_payload: Dict[str, str]) -> Dict[str, str]:
+    """Resolve all face directory paths in subjects_payload."""
+    return {subject_id: _resolve_dir_path(faces_dir) for subject_id, faces_dir in subjects_payload.items()}
 
 
 class PipelineStage(Enum):
@@ -126,6 +205,9 @@ class CoreEngineConfig:
     
     # Output settings
     output_path: str = CARTELLA_RISULTATI
+
+    # I2V provider: "fal" | "replicate" | "fal_then_replicate"
+    i2v_provider: str = "fal"
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -147,6 +229,11 @@ class CoreEngineConfig:
         if self.reference_faces_dir and not self.subjects_payload:
             self.subjects_payload = {"subject_1": self.reference_faces_dir}
             logger.info("Converted single subject to subjects_payload format")
+
+        if self.reference_faces_dir:
+            self.reference_faces_dir = _resolve_dir_path(self.reference_faces_dir)
+        if self.subjects_payload:
+            self.subjects_payload = _normalize_subjects_payload(self.subjects_payload)
     
     @property
     def num_subjects(self) -> int:
@@ -208,6 +295,19 @@ class PipelineProgressTracker:
         duration = time.time() - self.stage_times[stage.value]
         logger.info(f"Stage '{stage.value}' completed in {duration:.2f}s")
         return duration
+
+    def log_cumulative_eta(
+        self,
+        label: str,
+        remaining_low: float,
+        remaining_high: float,
+    ) -> None:
+        """Log cumulative pipeline ETA for upcoming work."""
+        logger.info(
+            "[ETA] Pipeline — %s: tempo stimato rimanente %s",
+            label,
+            format_eta_range(remaining_low, remaining_high),
+        )
     
     def get_total_time(self) -> float:
         """Get total elapsed time."""
@@ -321,7 +421,7 @@ class CoreEngine:
                 target_duration_seconds=config.duration_seconds,
                 crossfade_duration_seconds=config.crossfade_duration,
                 flickering_suppression_strength=config.flickering_suppression,
-                temporal_consistency=config.temporal_consistency
+                identity_consistency_threshold=config.temporal_consistency,
             ) if AutoregressiveConfig else None
             
             self.autoregressive_engine = AutoregressiveV2Engine(
@@ -341,6 +441,59 @@ class CoreEngine:
         logger.info(f"  Output directory: {config.output_path}")
         logger.info(f"  Duration target: {config.duration_seconds}s")
         logger.info(f"  Quality preset: {config.quality_preset.value}")
+
+    def _get_quality_params(self) -> Dict[str, Any]:
+        """Map quality preset to generation parameters (Flux + I2V)."""
+        tuning = get_preset_tuning(self.config.quality_preset)
+        return {
+            "num_inference_steps": tuning["flux_steps"],
+            "i2v_inference_steps": tuning["i2v_steps"],
+            "image_size": tuning["image_size"],
+            "resolution": tuning["resolution"],
+            "first_frame_timeout": tuning["first_frame_timeout"],
+            "i2v_timeout_multiplier": tuning["i2v_timeout_multiplier"],
+            "guidance_scale": tuning["guidance_scale"],
+        }
+
+    @staticmethod
+    def _is_content_policy_error(exc: Exception) -> bool:
+        from prompt_obfuscation import is_content_policy_error
+
+        return is_content_policy_error(exc)
+
+    @staticmethod
+    def _obfuscate_prompt(prompt: str) -> str:
+        from prompt_obfuscation import obfuscate_prompt
+
+        return obfuscate_prompt(prompt)
+
+    async def _resolve_controlnet_urls(
+        self,
+        controlnet_data: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Upload local ControlNet assets to Fal CDN when needed."""
+        from i2v_router import ensure_public_media_url
+
+        controlnet_video_url: Optional[str] = None
+        pose_map_url: Optional[str] = None
+
+        if self.config.controlnet_map_path:
+            try:
+                controlnet_video_url = await ensure_public_media_url(
+                    self.config.controlnet_map_path, self.api_key
+                )
+            except Exception as exc:
+                logger.warning("ControlNet video upload skipped: %s", exc)
+
+        if controlnet_data and controlnet_data.get("pose_map_path"):
+            try:
+                pose_map_url = await ensure_public_media_url(
+                    controlnet_data["pose_map_path"], self.api_key
+                )
+            except Exception as exc:
+                logger.warning("Pose map upload skipped: %s", exc)
+
+        return controlnet_video_url, pose_map_url
     
     async def generate_high_fidelity_video(
         self,
@@ -377,10 +530,10 @@ class CoreEngine:
         
         # Determine subjects payload
         if subjects_payload:
-            final_subjects_payload = subjects_payload
+            final_subjects_payload = _normalize_subjects_payload(subjects_payload)
             logger.info(f"Mode: Multi-Subject ({len(subjects_payload)} subjects)")
         elif reference_faces_dir:
-            final_subjects_payload = {"subject_1": reference_faces_dir}
+            final_subjects_payload = {"subject_1": _resolve_dir_path(reference_faces_dir)}
             logger.info(f"Mode: Single-Subject (legacy)")
         else:
             raise ValueError("Must provide either reference_faces_dir or subjects_payload")
@@ -394,6 +547,35 @@ class CoreEngine:
         logger.info(f"Target duration: {duration_seconds}s")
         logger.info(f"Quality: {self.config.quality_preset.value}")
         logger.info("="*70 + "\n")
+
+        # FASE 4: Cost estimate + daily budget circuit breaker
+        tuning = PRESET_TUNING.get(
+            self.config.quality_preset, PRESET_TUNING[QualityPreset.HIGH]
+        )
+        cost_config = {
+            "duration_seconds": duration_seconds,
+            "resolution": tuning.get("resolution", "720p"),
+            "fps": self.config.fps,
+            "endpoint": "fal-ai/wan-i2v",
+            "segment_duration": self.config.segment_duration,
+            "enable_autoregressive": self.config.enable_autoregressive,
+        }
+        cost_estimate = estimate_pipeline_cost(cost_config)
+        try:
+            check_budget(cost_estimate.total_usd)
+        except BudgetExceededError as exc:
+            logger.error(
+                "SAFE MODE: Daily API budget exceeded — generation blocked. %s",
+                exc,
+            )
+            raise
+        logger.info(
+            "Cost estimate: $%.4f USD (%d credits, %d segments @ %s)",
+            cost_estimate.total_usd,
+            cost_estimate.credits_required,
+            cost_estimate.num_segments,
+            cost_estimate.resolution,
+        )
         
         # Update config
         self.config.subjects_payload = final_subjects_payload
@@ -430,6 +612,10 @@ class CoreEngine:
         self._notify_progress(PipelineStage.CONTROLNET_PROCESSING, 3, 7)
         
         controlnet_data = await self._process_controlnet(controlnet_map_path, prompts)
+        self._controlnet_data = controlnet_data
+        self._controlnet_urls: Tuple[Optional[str], Optional[str]] = (None, None)
+        if controlnet_map_path or controlnet_data:
+            self._controlnet_urls = await self._resolve_controlnet_urls(controlnet_data)
         
         # Spatial masks for multi-subject
         spatial_masks = None
@@ -468,6 +654,23 @@ class CoreEngine:
         # STAGE 4: First Frame Generation (MULTI-SUBJECT AWARE)
         self.progress_tracker.start_stage(PipelineStage.FIRST_FRAME_GENERATION)
         self._notify_progress(PipelineStage.FIRST_FRAME_GENERATION, 4, 7)
+        draft_mode = self.config.quality_preset == QualityPreset.DRAFT
+        autoregressive = (
+            self.config.enable_autoregressive
+            and duration_seconds > self.config.segment_duration
+        )
+        ff_low, ff_high = estimate_pipeline_seconds(
+            duration_seconds,
+            draft_mode=draft_mode,
+            autoregressive=autoregressive,
+            segment_duration=self.config.segment_duration,
+            include_first_frame=True,
+        )
+        self.progress_tracker.log_cumulative_eta(
+            "prima del first frame (Flux + I2V)",
+            ff_low,
+            ff_high,
+        )
         
         first_frame_url = await self._generate_first_frame(
             prompts=prompts,
@@ -481,6 +684,18 @@ class CoreEngine:
         # STAGE 5: Video Generation
         self.progress_tracker.start_stage(PipelineStage.VIDEO_GENERATION)
         self._notify_progress(PipelineStage.VIDEO_GENERATION, 5, 7)
+        video_low, video_high = estimate_pipeline_seconds(
+            duration_seconds,
+            draft_mode=draft_mode,
+            autoregressive=autoregressive,
+            segment_duration=self.config.segment_duration,
+            include_first_frame=False,
+        )
+        self.progress_tracker.log_cumulative_eta(
+            "generazione video (I2V)",
+            video_low,
+            video_high,
+        )
         
         # For multi-subject, use the first subject's identity for video generation
         # (Full multi-subject video generation would require per-frame identity conditioning)
@@ -559,6 +774,8 @@ class CoreEngine:
         
         self.progress_tracker.end_stage(PipelineStage.COMPLETED)
         
+        record_spend(cost_estimate.total_usd)
+        
         self._print_final_summary(result)
         
         return result
@@ -605,7 +822,17 @@ class CoreEngine:
         stability_scores = {}
         
         for subject_id, faces_dir in subjects_payload.items():
+            faces_dir = _resolve_dir_path(faces_dir)
             logger.info(f"Processing {subject_id} from {faces_dir}")
+
+            cache_hash = compute_folder_hash(faces_dir)
+            cached = load_cached_identity(cache_hash)
+            if cached is not None:
+                super_vec, stability, _meta = cached
+                identity_vectors[subject_id] = super_vec
+                stability_scores[subject_id] = stability
+                logger.info(f"  {subject_id}: {stability*100:.1f}% stability (cached)")
+                continue
             
             if MultiAngleIdentityLock:
                 # Reinitialize identity locker for each subject
@@ -626,6 +853,19 @@ class CoreEngine:
                 
                 identity_vectors[subject_id] = super_vec.vector
                 stability_scores[subject_id] = stability
+                
+                num_images = len(list(Path(faces_dir).iterdir()))
+                save_cached_identity(
+                    cache_hash,
+                    super_vec.vector,
+                    stability,
+                    metadata={
+                        "subject_id": subject_id,
+                        "faces_dir": faces_dir,
+                        "num_images": num_images,
+                        "num_angles": self.config.num_angles,
+                    },
+                )
                 
                 logger.info(f"  {subject_id}: {stability*100:.1f}% stability")
             else:
@@ -703,6 +943,8 @@ class CoreEngine:
         
         if not self.api_key:
             raise ValueError("FAL_KEY not set in environment or constructor")
+
+        quality = self._get_quality_params()
         
         num_subjects = len(identity_vectors)
         logger.info(f"  Subjects: {num_subjects}")
@@ -718,11 +960,11 @@ class CoreEngine:
             # Prepare payload for Fal.ai
             payload = {
                 "prompt": prompts.get("prompt", ""),
-                "image_size": "landscape_16_9",  # 16:9 aspect ratio for video
-                "num_inference_steps": 28,
+                "image_size": quality["image_size"],
+                "num_inference_steps": quality["num_inference_steps"],
                 "num_images": 1,
                 "enable_safety_checker": False,  # Critical for custom tensors
-                "guidance_scale": 7.5,
+                "guidance_scale": quality["guidance_scale"],
             }
             
             # Add negative prompting if provided
@@ -765,11 +1007,11 @@ class CoreEngine:
             # Prepare payload
             payload = {
                 "prompt": combined_prompt,
-                "image_size": "landscape_16_9",
-                "num_inference_steps": 28,
+                "image_size": quality["image_size"],
+                "num_inference_steps": quality["num_inference_steps"],
                 "num_images": 1,
                 "enable_safety_checker": False,
-                "guidance_scale": 7.5,
+                "guidance_scale": quality["guidance_scale"],
             }
             
             # Add negative prompt
@@ -782,34 +1024,61 @@ class CoreEngine:
             logger.info("Full regional IP-Adapter requires specialized endpoint support")
         
         # Define the actual API call as a nested async function for retry
+        obfuscation_attempted = False
+
         async def _api_call():
-            logger.info(f"Submitting first frame generation to Fal.ai...")
-            logger.info(f"  Prompt: {payload['prompt'][:100]}...")
-            
-            # Submit async job to Fal.ai
+            nonlocal obfuscation_attempted
+            logger.info("Submitting first frame generation to Fal.ai...")
+            logger.info("  Prompt: %s...", payload["prompt"][:100])
+
             handler = await fal_client.submit_async(
                 "fal-ai/flux/dev",
-                arguments=payload
+                arguments=payload,
             )
-            
-            # Wait for completion with timeout
-            logger.info("Waiting for first frame generation (timeout: 120s)...")
-            result = await handler.get(timeout=120)
-            
-            # Extract image URL
+
+            first_frame_timeout = quality["first_frame_timeout"]
+            draft_mode = self.config.quality_preset == QualityPreset.DRAFT
+            estimated = estimate_first_frame_seconds(draft_mode=draft_mode)
+            logger.info(
+                "Waiting for first frame generation (timeout: %ss)...",
+                first_frame_timeout,
+            )
+            try:
+                result = await submit_and_wait_with_eta(
+                    handler,
+                    estimated,
+                    "First frame Flux",
+                    timeout=first_frame_timeout,
+                    step_info="step 1/1 first frame",
+                )
+            except Exception as exc:
+                if self._is_content_policy_error(exc) and not obfuscation_attempted:
+                    logger.warning(
+                        "[WARNING] Server-side policy filter triggered. "
+                        "Initiating Prompt Obfuscation..."
+                    )
+                    payload["prompt"] = self._obfuscate_prompt(payload["prompt"])
+                    if payload.get("negative_prompt"):
+                        payload["negative_prompt"] = self._obfuscate_prompt(
+                            payload["negative_prompt"]
+                        )
+                    obfuscation_attempted = True
+                    return await _api_call()
+                raise
+
             images = result.get("images", [])
             if not images:
                 raise ValueError("No images returned from Flux.1 Dev")
-            
+
             image_url = images[0].get("url")
             if not image_url:
                 raise ValueError("Image URL not found in response")
-            
-            logger.info(f"✓ First frame generated successfully")
-            logger.info(f"  URL: {image_url}")
-            
+
+            logger.info("✓ First frame generated successfully")
+            logger.info("  URL: %s", image_url)
+
             return image_url
-        
+
         # Execute with retry logic
         try:
             image_url = await retry_with_backoff(
@@ -852,7 +1121,11 @@ class CoreEngine:
         first_frame_url: str,
         prompts: Dict[str, str],
         identity_vector: np.ndarray,
-        duration: float
+        duration: float,
+        *,
+        segment_index: int = 1,
+        segment_total: int = 1,
+        on_progress: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
         """
         Generate single video segment using Wan I2V (Image-to-Video).
@@ -867,14 +1140,33 @@ class CoreEngine:
             Dictionary with video URL and metadata
         """
         logger.info(f"Generating single video segment ({duration}s) with Wan I2V...")
+        stage_label = f"Generazione video (segmento {segment_index}/{segment_total})"
         
         if self.animatediff_engine:
-            # Use AnimateDiff engine if available (it has real API calls)
+            quality = self._get_quality_params()
+            controlnet_video_url, pose_map_url = getattr(
+                self, "_controlnet_urls", (None, None)
+            )
             result = await self.animatediff_engine.generate_cinematic_video(
                 prompt=prompts['prompt'],
                 first_frame_url=first_frame_url,
                 negative_prompt=prompts['negative_prompt'],
-                identity_vector=identity_vector
+                identity_vector=identity_vector,
+                motion_override={
+                    "resolution": quality["resolution"],
+                    "timeout_multiplier": quality["i2v_timeout_multiplier"],
+                    "draft_mode": self.config.quality_preset == QualityPreset.DRAFT,
+                    "duration_seconds": duration,
+                    "num_inference_steps": quality["i2v_inference_steps"],
+                    "require_last_frame": self.config.enable_autoregressive,
+                    "stage_label": stage_label,
+                    "segment_index": segment_index,
+                    "segment_total": segment_total,
+                    "on_progress": on_progress,
+                    "controlnet_video_url": controlnet_video_url,
+                    "pose_map_url": pose_map_url,
+                    "identity_adapter_strength": self.config.identity_adapter_strength,
+                },
             )
             
             return {
@@ -886,93 +1178,68 @@ class CoreEngine:
                 'temporal_consistency': 1.0
             }
         
-        # Fallback: Direct Fal.ai Wan I2V call
-        if not fal_client:
-            raise RuntimeError("fal_client not available. Install with: pip install fal-client")
-        
         if not self.api_key:
             raise ValueError("FAL_KEY not set in environment or constructor")
-        
-        # Motion preset mapping
-        motion_strength_map = {
-            "static": 0.2,
-            "subtle": 0.4,
-            "smooth": 0.6,
-            "cinematic": 0.8,
-            "dynamic": 1.0
-        }
-        
-        motion_preset = self.config.motion_preset if hasattr(self.config, 'motion_preset') else "smooth"
-        motion_strength = motion_strength_map.get(motion_preset, 0.6)
-        
-        # Prepare payload for Wan I2V
-        payload = {
-            "image_url": first_frame_url,
-            "prompt": prompts.get("prompt", ""),
-            "duration": min(int(duration), 10),  # Wan typically supports up to 10s
-            "fps": self.config.fps if hasattr(self.config, 'fps') else 24,
-            "resolution": "720p",
-            "motion_strength": motion_strength,
-            "seed": -1,  # Random seed
-            "enable_loop": False,
-        }
-        
-        # Add negative prompt if available
-        if "negative_prompt" in prompts and prompts["negative_prompt"]:
-            payload["negative_prompt"] = prompts["negative_prompt"]
-        
-        # Define the actual API call as a nested async function for retry
+
+        from i2v_router import generate_i2v_with_fallback
+
+        motion_preset = (
+            self.config.motion_preset if hasattr(self.config, "motion_preset") else "smooth"
+        )
+        fps = self.config.fps if hasattr(self.config, "fps") else 24
+        quality = self._get_quality_params()
+        controlnet_video_url, pose_map_url = getattr(self, "_controlnet_urls", (None, None))
+
         async def _api_call():
-            logger.info(f"Submitting video generation to Fal.ai Wan I2V...")
+            logger.info("Submitting video generation via I2V fallback router...")
             logger.info(f"  First frame: {first_frame_url}")
             logger.info(f"  Duration: {duration}s")
-            logger.info(f"  Motion preset: {motion_preset} (strength: {motion_strength})")
-            
-            # Submit job to Fal.ai
-            handler = await fal_client.submit_async(
-                "fal-ai/wan-v2.2-i2v",  # Wan V2.2 Image-to-Video endpoint
-                arguments=payload
+            logger.info(f"  Motion preset: {motion_preset}")
+            logger.info(f"  Resolution: {quality['resolution']}")
+            logger.info(f"  I2V steps: {quality['i2v_inference_steps']}")
+            if controlnet_video_url:
+                logger.info("  ControlNet video conditioning: enabled")
+            if pose_map_url:
+                logger.info("  Pose map conditioning: enabled")
+            return await generate_i2v_with_fallback(
+                image_url=first_frame_url,
+                prompt=prompts.get("prompt", ""),
+                duration=duration,
+                negative_prompt=prompts.get("negative_prompt", ""),
+                motion_preset=motion_preset,
+                fps=fps,
+                resolution=quality["resolution"],
+                timeout_multiplier=quality["i2v_timeout_multiplier"],
+                draft_mode=self.config.quality_preset == QualityPreset.DRAFT,
+                require_last_frame=self.config.enable_autoregressive,
+                api_key=self.api_key,
+                provider=getattr(self.config, "i2v_provider", "fal"),
+                stage_label=stage_label,
+                segment_index=segment_index,
+                segment_total=segment_total,
+                on_progress=on_progress,
+                identity_vector=identity_vector,
+                identity_adapter_strength=self.config.identity_adapter_strength,
+                controlnet_video_url=controlnet_video_url,
+                pose_map_url=pose_map_url,
+                num_inference_steps=quality["i2v_inference_steps"],
             )
-            
-            # Wait with long timeout (video generation is slow)
-            logger.info("Waiting for video generation (timeout: 300s)...")
-            result = await handler.get(timeout=300)
-            
-            # Extract video URL
-            video_data = result.get("video", {})
-            video_url = video_data.get("url")
-            if not video_url:
-                raise ValueError("Video URL not found in response")
-            
-            # Extract last frame URL for autoregressive loop
-            last_frame_data = result.get("last_frame", {})
-            last_frame_url = last_frame_data.get("url")
-            
-            logger.info(f"✓ Video segment generated successfully")
-            logger.info(f"  Video URL: {video_url}")
-            if last_frame_url:
-                logger.info(f"  Last frame URL: {last_frame_url}")
-            
-            return {
-                'video_url': video_url,
-                'duration': duration,
-                'last_frame_url': last_frame_url,
-                'num_segments': 1,
-                'mean_drift': 0.0,
-                'temporal_consistency': 1.0
-            }
-        
-        # Execute with retry logic
+
         try:
             result = await retry_with_backoff(
                 _api_call,
-                max_retries=3,
-                initial_delay=5.0,  # Longer initial delay for video generation
+                max_retries=1,
+                initial_delay=5.0,
                 backoff_factor=2.0,
-                exceptions=(httpx.HTTPError, asyncio.TimeoutError, ValueError, RuntimeError)
+                exceptions=(httpx.HTTPError, ValueError, RuntimeError),
+            )
+            logger.info(
+                "Video segment generated via %s (%s)%s",
+                result.get("provider_id"),
+                result.get("endpoint_id"),
+                " [obfuscation applied]" if result.get("obfuscation_applied") else "",
             )
             return result
-            
         except Exception as e:
             logger.error(f"Video generation failed after all retries: {type(e).__name__}: {e}")
             raise RuntimeError(f"Failed to generate video: {e}") from e
@@ -1032,7 +1299,14 @@ class CoreEngine:
         first_frame_url = params.get('first_frame_url', '')
         identity_vector = params.get('identity_vector')
         negative_prompt = params.get('negative_prompt', '')
-        duration = params.get('duration', self.config.segment_duration)
+        duration = params.get('duration_seconds') or params.get(
+            'duration', self.config.segment_duration
+        )
+        segment_index = int(params.get("segment_index", 0)) + 1
+        segment_total = int(
+            params.get("num_segments")
+            or max(1, int(np.ceil(self.config.duration_seconds / self.config.segment_duration)))
+        )
         
         # Build prompts dict
         prompts = {
@@ -1045,16 +1319,26 @@ class CoreEngine:
             first_frame_url=first_frame_url,
             prompts=prompts,
             identity_vector=identity_vector,
-            duration=duration
+            duration=duration,
+            segment_index=segment_index,
+            segment_total=segment_total,
         )
         
         video_url = result.get('video_url', '')
-        last_frame_url = result.get('last_frame_url', '')
+        last_frame_url = result.get('last_frame_url') or ''
         
         if not video_url:
             raise ValueError("Video URL not returned from generation")
         
-        logger.info(f"✓ Segment generated for autoregressive loop")
+        if not last_frame_url:
+            from i2v_router import ensure_last_frame_url
+
+            last_frame_url = await ensure_last_frame_url(
+                video_url, None, self.api_key
+            )
+        
+        logger.info("✓ Segment generated for autoregressive loop")
+        logger.info("  last_frame_url ready for next segment propagation")
         
         return video_url, last_frame_url
     
@@ -1069,7 +1353,7 @@ class CoreEngine:
         Returns:
             Absolute path to the downloaded video file
         """
-        logger.info("Finalizing video: downloading from remote URL...")
+        logger.info("Finalizing video...")
         
         video_url = video_result.get('video_url')
         if not video_url:
@@ -1083,6 +1367,21 @@ class CoreEngine:
         timestamp = int(time.time())
         filename = f"final_video_{timestamp}.mp4"
         local_path = output_dir / filename
+
+        source_path = Path(video_url)
+        if not str(video_url).startswith(("http://", "https://")):
+            if not source_path.exists():
+                raise FileNotFoundError(f"Local video not found: {video_url}")
+            logger.info(f"Copying local video from: {source_path}")
+            logger.info(f"Saving to: {local_path}")
+            shutil.copy2(source_path, local_path)
+            file_size = local_path.stat().st_size
+            if file_size == 0:
+                raise IOError("Copied video file is empty")
+            logger.info("✓ Video finalized from local path")
+            logger.info(f"  Local path: {local_path}")
+            logger.info(f"  File size: {file_size / 1024 / 1024:.2f} MB")
+            return str(local_path.absolute())
         
         logger.info(f"Downloading video from: {video_url}")
         logger.info(f"Saving to: {local_path}")

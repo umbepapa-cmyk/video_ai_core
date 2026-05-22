@@ -11,8 +11,14 @@ Pillow>=9.0.0
 # Fal.ai client for video generation
 fal-client>=0.4.0
 
+# Replicate cloud I2V fallback
+replicate>=1.0.0
+
 # OpenCV for video processing and skeleton detection
 opencv-python>=4.8.0
+
+# FFmpeg Python bindings for dynamic retriever
+ffmpeg-python>=0.2.0
 
 # Optional: ControlNet auxiliary for OpenPose detection
 # Install with: pip install controlnet-aux
