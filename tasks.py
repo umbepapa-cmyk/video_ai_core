@@ -38,12 +38,16 @@ from security_module import (
 )
 from celebrity_blocker import CelebrityBlocker, CelebrityBlockingError
 
+# Dynamic video retrieval
+from dynamic_retriever import KinematicRetriever, RetrieverError
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize global instances
 age_verifier = AgeVerifier()
 celebrity_blocker = CelebrityBlocker()
+kinematic_retriever = KinematicRetriever()
 
 
 # ============================================================================
@@ -136,6 +140,7 @@ def generate_video_task(
     prompt: str,
     duration_seconds: int = 10,
     controlnet_map_path: Optional[str] = None,
+    motion_keyword: Optional[str] = None,
     credits_consumed: int = 0
 ) -> Dict[str, Any]:
     """
@@ -143,6 +148,7 @@ def generate_video_task(
     
     States:
     - PENDING: Task is queued
+    - DOWNLOADING_REFERENCE: Downloading motion reference video (if motion_keyword provided)
     - PROCESSING: Inference in progress (with substages)
     - STITCHING: FFmpeg crossfade application
     - UPLOADING: Uploading to storage
@@ -155,6 +161,7 @@ def generate_video_task(
         prompt: Text prompt for video generation
         duration_seconds: Target video duration
         controlnet_map_path: Optional ControlNet pose map
+        motion_keyword: Optional motion keyword for dynamic retrieval (e.g., "ballet spinning")
         credits_consumed: Credits consumed for this job
         
     Returns:
@@ -165,6 +172,65 @@ def generate_video_task(
     logger.info(f"Starting video generation task {task_id} for user {user_id}")
     
     try:
+        # ====================================================================
+        # STAGE 0: Dynamic Motion Reference Retrieval (if motion_keyword provided)
+        # ====================================================================
+        
+        if motion_keyword:
+            logger.info(f"Motion keyword provided: '{motion_keyword}'")
+            
+            # Check local cache first
+            motion_path = check_local_motion_cache(motion_keyword)
+            
+            if not motion_path:
+                # Cache MISS - invoke dynamic retriever
+                self.update_state(
+                    state='DOWNLOADING_REFERENCE',
+                    meta={
+                        'stage': 'downloading_reference',
+                        'progress': 5,
+                        'message': f'Downloading motion reference: {motion_keyword}...',
+                        'user_id': user_id,
+                        'task_id': task_id
+                    }
+                )
+                
+                logger.info(f"Cache miss - downloading motion reference for '{motion_keyword}'")
+                
+                try:
+                    # Run async retrieval in event loop
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                    
+                    motion_path = loop.run_until_complete(
+                        kinematic_retriever.search_and_download(
+                            query=motion_keyword,
+                            max_duration=min(duration_seconds, 10)
+                        )
+                    )
+                    
+                    logger.info(f"✓ Motion reference downloaded: {motion_path}")
+                
+                except RetrieverError as retriever_error:
+                    logger.error(f"Failed to download motion reference: {retriever_error}")
+                    logger.warning("Continuing without motion reference (controlnet_map_path will be None)")
+                    motion_path = None
+                
+                except Exception as e:
+                    logger.error(f"Unexpected error during motion reference download: {e}")
+                    logger.warning("Continuing without motion reference")
+                    motion_path = None
+            else:
+                logger.info(f"✓ Motion reference found in cache: {motion_path}")
+            
+            # Override controlnet_map_path with motion reference path
+            if motion_path:
+                controlnet_map_path = motion_path
+                logger.info(f"Using motion reference as ControlNet map: {controlnet_map_path}")
+        
         # ====================================================================
         # STAGE 1: Biometric Extraction & Security Checks
         # ====================================================================
@@ -403,6 +469,34 @@ def generate_video_task(
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+def check_local_motion_cache(motion_keyword: str) -> Optional[str]:
+    """
+    Check if motion reference video is already in local cache.
+    
+    This provides O(1) cache lookup without invoking the full retriever.
+    
+    Args:
+        motion_keyword: Motion keyword to search for
+        
+    Returns:
+        Path to cached video or None if cache miss
+    """
+    try:
+        # Use retriever's cache check method
+        cached_path = kinematic_retriever._check_cache(motion_keyword)
+        
+        if cached_path and cached_path.exists():
+            logger.info(f"Cache hit for motion keyword '{motion_keyword}': {cached_path}")
+            return str(cached_path.absolute())
+        
+        logger.info(f"Cache miss for motion keyword '{motion_keyword}'")
+        return None
+    
+    except Exception as e:
+        logger.warning(f"Error checking motion cache: {e}")
+        return None
+
 
 def upload_video_to_storage(
     video_path: str,

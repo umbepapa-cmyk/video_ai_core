@@ -1,0 +1,63 @@
+================================================================================
+ISTRUZIONI: Posiziona il Video Selfie Qui
+================================================================================
+
+Per eseguire il test End-to-End, è necessario un video selfie.
+
+FILE RICHIESTO:
+    inputs/mio_selfie.mp4
+
+COME REGISTRARE IL VIDEO:
+    1. Durata: 5-30 secondi (10-15 secondi è ideale)
+    2. Risoluzione: 720p o superiore
+    3. Formato: MP4 (H.264)
+    4. Contenuto: Viso chiaramente visibile
+    
+BEST PRACTICES:
+    ✓ Illuminazione frontale uniforme (no controluce)
+    ✓ Ruota lentamente la testa da sinistra a destra
+    ✓ Mantieni espressione neutra
+    ✓ Camera stabile (usa treppiede se possibile)
+    ✓ Sfondo neutro
+    
+DA EVITARE:
+    ✗ Movimenti troppo rapidi (causa blur)
+    ✗ Illuminazione scarsa o ombre forti
+    ✗ Occhiali riflettenti
+    ✗ Cappelli che coprono parte del viso
+    ✗ Controluce (viso in ombra)
+
+ESEMPIO DI REGISTRAZIONE:
+    1. Posiziona la camera frontalmente
+    2. Guarda la camera
+    3. Ruota lentamente la testa verso sinistra (~45°)
+    4. Torna al centro
+    5. Ruota lentamente verso destra (~45°)
+    6. Torna al centro
+    7. Stop
+    
+    Tempo totale: ~10-15 secondi
+
+VERIFICA QUALITÀ:
+    Dopo la registrazione, verifica che:
+    - Il viso sia sempre chiaramente visibile
+    - Non ci siano parti sfocate significative
+    - L'illuminazione sia costante
+    - Il video non sia troppo scuro
+
+PRIVACY:
+    Il video rimane in questa cartella sotto il tuo controllo.
+    Durante il test E2E:
+    - Vengono estratti 5 frame temporanei
+    - I frame vengono eliminati automaticamente dopo il test
+    - Solo il video generato viene conservato in outputs/
+    
+    Il video sorgente NON viene mai caricato o inviato da nessuna parte
+    senza il tuo esplicito consenso.
+
+================================================================================
+DOPO AVER POSIZIONATO IL VIDEO:
+    python run_e2e_test.py
+================================================================================
+
+Per ulteriori informazioni, vedi README_E2E_TEST.md

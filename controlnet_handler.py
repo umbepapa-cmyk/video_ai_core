@@ -24,6 +24,9 @@ from PIL import Image
 from dotenv import load_dotenv
 from path_config import CARTELLA_MAPPE_POSE
 
+# Import custom exceptions
+from exceptions import KinematicMismatchError, SubjectTrackingLossError
+
 try:
     import fal_client
 except ImportError:
@@ -464,6 +467,409 @@ class ControlNetHandler:
         logger.info(f"Entanglement prevention added to prompt")
         
         return enhanced_prompt
+    
+    def detect_multiple_skeletons(
+        self,
+        video_path: str,
+        num_expected_subjects: int
+    ) -> Dict[str, List[Dict]]:
+        """
+        Detect multiple skeletons in motion reference video.
+        
+        This method:
+        1. Detects pose skeletons frame-by-frame using OpenPose
+        2. Tracks subjects across frames using IoU (Intersection over Union)
+        3. Assigns consistent subject IDs based on spatial position
+        4. Validates that detected skeleton count matches expected subjects
+        
+        Args:
+            video_path: Path to motion reference video
+            num_expected_subjects: Expected number of subjects
+            
+        Returns:
+            Dictionary mapping subject_id to list of bounding boxes per frame.
+            Format: {
+                "subject_1": [
+                    {"frame": 0, "bbox": [x, y, w, h], "keypoints": [...]},
+                    {"frame": 1, "bbox": [x2, y2, w2, h2], "keypoints": [...]},
+                    ...
+                ],
+                "subject_2": [...],
+            }
+        
+        Raises:
+            KinematicMismatchError: If detected skeletons != num_expected_subjects
+            SubjectTrackingLossError: If subject tracking fails across frames
+        """
+        logger.info(f"Detecting skeletons in {video_path}")
+        logger.info(f"Expected subjects: {num_expected_subjects}")
+        
+        try:
+            import cv2
+        except ImportError:
+            logger.error("OpenCV (cv2) is required for video skeleton detection")
+            raise ImportError("Install OpenCV: pip install opencv-python")
+        
+        try:
+            # Try to import OpenPose detector from controlnet_aux
+            from controlnet_aux import OpenposeDetector
+            detector = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
+            logger.info("Using controlnet_aux OpenposeDetector")
+            use_real_detector = True
+        except ImportError:
+            logger.warning("controlnet_aux not available, using mock skeleton detection")
+            logger.warning("Install with: pip install controlnet-aux")
+            detector = None
+            use_real_detector = False
+        
+        # Read video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+        
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        logger.info(f"Video info: {frame_count} frames at {fps} FPS")
+        
+        all_detections = []
+        
+        # Process each frame
+        for frame_idx in range(frame_count):
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning(f"Failed to read frame {frame_idx}, stopping detection")
+                break
+            
+            # Detect poses
+            if use_real_detector:
+                # Real OpenPose detection
+                pose_result = detector(frame, detect_resolution=512)
+                skeletons = self._extract_skeletons_from_pose_real(pose_result, frame_idx)
+            else:
+                # Mock detection for testing
+                skeletons = self._extract_skeletons_from_pose_mock(
+                    frame, 
+                    frame_idx, 
+                    num_expected_subjects
+                )
+            
+            all_detections.append({
+                "frame": frame_idx,
+                "skeletons": skeletons
+            })
+            
+            # Log progress every 30 frames
+            if frame_idx % 30 == 0:
+                logger.info(f"  Processed frame {frame_idx}/{frame_count}")
+        
+        cap.release()
+        
+        if not all_detections:
+            raise ValueError("No frames were successfully processed")
+        
+        # Validate number of subjects in first frame
+        num_detected = len(all_detections[0]["skeletons"]) if all_detections else 0
+        
+        if num_detected != num_expected_subjects:
+            raise KinematicMismatchError(
+                f"Skeleton count mismatch in first frame",
+                expected_count=num_expected_subjects,
+                detected_count=num_detected
+            )
+        
+        logger.info(f"✓ First frame validation passed: {num_detected} skeletons detected")
+        
+        # Track and assign consistent subject IDs
+        try:
+            tracked_subjects = self._track_subjects_across_frames(all_detections, num_expected_subjects)
+        except Exception as e:
+            logger.error(f"Subject tracking failed: {e}")
+            raise SubjectTrackingLossError(
+                f"Failed to track subjects across frames: {e}"
+            )
+        
+        logger.info(f"✓ Successfully tracked {len(tracked_subjects)} subjects across {frame_count} frames")
+        
+        # Validate tracking completeness
+        for subject_id, detections in tracked_subjects.items():
+            if len(detections) < frame_count * 0.9:  # Allow 10% missing frames
+                logger.warning(
+                    f"{subject_id} detected in only {len(detections)}/{frame_count} frames"
+                )
+        
+        return tracked_subjects
+    
+    def _extract_skeletons_from_pose_real(
+        self, 
+        pose_result, 
+        frame_idx: int
+    ) -> List[Dict]:
+        """
+        Extract individual skeletons from real OpenPose result.
+        
+        Args:
+            pose_result: OpenPose detection result
+            frame_idx: Current frame index
+            
+        Returns:
+            List of skeleton dictionaries with bbox and keypoints
+        """
+        skeletons = []
+        
+        # OpenPose result format varies by implementation
+        # This is a generic parser for controlnet_aux output
+        
+        try:
+            # controlnet_aux returns PIL image with drawn skeleton
+            # We need to parse the drawn skeleton back to keypoints
+            # For now, we use a simplified approach
+            
+            # Convert pose_result to numpy if it's a PIL image
+            if hasattr(pose_result, 'convert'):
+                pose_array = np.array(pose_result.convert('RGB'))
+            else:
+                pose_array = np.array(pose_result)
+            
+            # Detect connected components (individual skeletons)
+            # This is a simplified heuristic - in production you'd parse actual keypoints
+            
+            gray = cv2.cvtColor(pose_array, cv2.COLOR_RGB2GRAY) if len(pose_array.shape) == 3 else pose_array
+            _, binary = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+            
+            # Find contours (approximate skeleton regions)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter small contours and create bounding boxes
+            min_area = 1000  # Minimum area for valid skeleton
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < min_area:
+                    continue
+                
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Normalize to [0, 1]
+                height, width = pose_array.shape[:2]
+                norm_x = x / width
+                norm_y = y / height
+                norm_w = w / width
+                norm_h = h / height
+                
+                skeletons.append({
+                    "bbox": [norm_x, norm_y, norm_w, norm_h],
+                    "keypoints": [],  # TODO: Extract actual keypoints from pose_result
+                    "area": area
+                })
+            
+            # Sort by x-coordinate (left to right) for consistency
+            skeletons.sort(key=lambda s: s["bbox"][0])
+            
+        except Exception as e:
+            logger.warning(f"Failed to parse OpenPose result at frame {frame_idx}: {e}")
+            # Return empty list if parsing fails
+            skeletons = []
+        
+        return skeletons
+    
+    def _extract_skeletons_from_pose_mock(
+        self, 
+        frame: np.ndarray, 
+        frame_idx: int,
+        num_subjects: int
+    ) -> List[Dict]:
+        """
+        Mock skeleton extraction for testing when OpenPose is unavailable.
+        
+        Args:
+            frame: Video frame
+            frame_idx: Current frame index
+            num_subjects: Number of subjects to mock
+            
+        Returns:
+            List of mock skeleton dictionaries
+        """
+        skeletons = []
+        height, width = frame.shape[:2]
+        
+        # Create mock skeletons with realistic movement
+        for i in range(num_subjects):
+            # Simulate subjects positioned left-to-right
+            base_x = 0.2 + (i * 0.6 / max(1, num_subjects - 1)) if num_subjects > 1 else 0.4
+            
+            # Add small temporal variation (simulated movement)
+            time_offset = np.sin(frame_idx * 0.1 + i) * 0.05
+            
+            mock_bbox = [
+                base_x + time_offset,  # x
+                0.2,  # y
+                0.15,  # w
+                0.6   # h
+            ]
+            
+            # Mock keypoints (25 body keypoints in normalized coords)
+            mock_keypoints = []
+            for kp_idx in range(25):
+                kp_x = mock_bbox[0] + np.random.rand() * mock_bbox[2]
+                kp_y = mock_bbox[1] + np.random.rand() * mock_bbox[3]
+                kp_conf = 0.8 + np.random.rand() * 0.2
+                mock_keypoints.append([kp_x, kp_y, kp_conf])
+            
+            skeletons.append({
+                "bbox": mock_bbox,
+                "keypoints": mock_keypoints,
+                "area": mock_bbox[2] * mock_bbox[3] * width * height
+            })
+        
+        return skeletons
+    
+    def _track_subjects_across_frames(
+        self, 
+        all_detections: List[Dict],
+        num_expected_subjects: int
+    ) -> Dict[str, List[Dict]]:
+        """
+        Track subjects across frames using spatial consistency (IoU).
+        
+        Assigns consistent IDs to subjects by:
+        1. Sorting by x-coordinate (left to right) in first frame
+        2. Tracking via IoU (Intersection over Union) in subsequent frames
+        
+        Args:
+            all_detections: List of detections per frame
+            num_expected_subjects: Expected number of subjects
+            
+        Returns:
+            Dictionary mapping subject_id to list of detections
+            
+        Raises:
+            SubjectTrackingLossError: If subject tracking is lost
+        """
+        tracked = {}
+        
+        if not all_detections:
+            return tracked
+        
+        # Initialize with first frame - sort skeletons left to right
+        first_frame_skeletons = sorted(
+            all_detections[0]["skeletons"],
+            key=lambda s: s["bbox"][0]  # Sort by x coordinate
+        )
+        
+        # Assign IDs
+        for idx, skeleton in enumerate(first_frame_skeletons, 1):
+            subject_id = f"subject_{idx}"
+            tracked[subject_id] = [{
+                "frame": 0,
+                "bbox": skeleton["bbox"],
+                "keypoints": skeleton.get("keypoints", [])
+            }]
+        
+        logger.info(f"Initialized tracking for {len(tracked)} subjects")
+        
+        # Track through remaining frames using IoU
+        for frame_data in all_detections[1:]:
+            frame_idx = frame_data["frame"]
+            current_skeletons = frame_data["skeletons"]
+            
+            # Validate skeleton count
+            if len(current_skeletons) != num_expected_subjects:
+                logger.warning(
+                    f"Frame {frame_idx}: Expected {num_expected_subjects} skeletons, "
+                    f"detected {len(current_skeletons)}"
+                )
+            
+            # Match current skeletons to tracked subjects
+            matched_subjects = set()
+            
+            for subject_id, history in tracked.items():
+                last_bbox = history[-1]["bbox"]
+                
+                # Find best matching skeleton via IoU
+                best_match = self._find_best_match(last_bbox, current_skeletons, matched_subjects)
+                
+                if best_match:
+                    tracked[subject_id].append({
+                        "frame": frame_idx,
+                        "bbox": best_match["bbox"],
+                        "keypoints": best_match.get("keypoints", [])
+                    })
+                    matched_subjects.add(id(best_match))
+                else:
+                    # Subject lost - log warning but continue
+                    logger.warning(f"{subject_id} lost at frame {frame_idx}")
+        
+        return tracked
+    
+    def _find_best_match(
+        self, 
+        ref_bbox: List[float], 
+        candidates: List[Dict],
+        exclude_ids: set = None
+    ) -> Optional[Dict]:
+        """
+        Find best matching skeleton via IoU.
+        
+        Args:
+            ref_bbox: Reference bounding box [x, y, w, h]
+            candidates: List of candidate skeletons
+            exclude_ids: Set of already matched skeleton IDs to exclude
+            
+        Returns:
+            Best matching skeleton or None if no good match
+        """
+        if exclude_ids is None:
+            exclude_ids = set()
+        
+        best_iou = 0.0
+        best_match = None
+        
+        for candidate in candidates:
+            # Skip already matched candidates
+            if id(candidate) in exclude_ids:
+                continue
+            
+            iou = self._calculate_iou(ref_bbox, candidate["bbox"])
+            if iou > best_iou:
+                best_iou = iou
+                best_match = candidate
+        
+        # IoU threshold for valid match
+        iou_threshold = 0.3
+        return best_match if best_iou > iou_threshold else None
+    
+    def _calculate_iou(self, bbox1: List[float], bbox2: List[float]) -> float:
+        """
+        Calculate Intersection over Union between two bounding boxes.
+        
+        Args:
+            bbox1: First bounding box [x, y, w, h] in normalized coords
+            bbox2: Second bounding box [x, y, w, h] in normalized coords
+            
+        Returns:
+            IoU score (0.0 to 1.0)
+        """
+        x1, y1, w1, h1 = bbox1
+        x2, y2, w2, h2 = bbox2
+        
+        # Calculate intersection
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        
+        # Calculate union
+        area1 = w1 * h1
+        area2 = w2 * h2
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
 
 
 # Convenience functions

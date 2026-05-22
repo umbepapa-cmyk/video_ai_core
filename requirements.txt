@@ -1,109 +1,34 @@
-# Day 1 — Fal.ai API test
-fal-client>=0.5.6
-python-dotenv>=1.0.1
+# Multi-Agent Spatial Conditioning - Requirements
+# ================================================
 
-# Fase 1 — Computer Vision & Frame Extraction
-opencv-python==4.9.0.80
-opencv-contrib-python==4.9.0.80
-numpy==1.24.3
-Pillow==10.2.0
+# Core dependencies
+python-dotenv>=1.0.0
+numpy>=1.21.0
+httpx>=0.24.0
+aiofiles>=23.0.0
+Pillow>=9.0.0
 
-# Fase 2 — Security & Age Verification
-deepface==0.0.88
-tf-keras==2.16.0
-tensorflow==2.16.1
+# Fal.ai client for video generation
+fal-client>=0.4.0
 
-# Fase 3 — API & Video Processing
-httpx==0.27.0
-aiohttp==3.9.3
-requests==2.31.0
+# OpenCV for video processing and skeleton detection
+opencv-python>=4.8.0
 
-# Fase 4 — Database (Supabase)
-supabase==2.4.1
-postgrest==0.16.2
-psycopg2-binary==2.9.9
+# Optional: ControlNet auxiliary for OpenPose detection
+# Install with: pip install controlnet-aux
+# For GPU support: pip install controlnet-aux[gpu]
+# controlnet-aux>=0.0.7
 
-# Fase 5 — Web Framework
-fastapi==0.109.2
-uvicorn[standard]==0.27.1
-streamlit==1.31.1
-python-multipart==0.0.9
-pydantic==2.6.1
-pydantic-settings==2.1.0
-aiofiles==23.2.1
+# Optional: PyTorch (required by controlnet-aux)
+# Install separately based on your CUDA version:
+# CPU only: pip install torch torchvision
+# CUDA 11.8: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# torch>=2.0.0
+# torchvision>=0.15.0
 
-# ============================================================
-# WEEK 3 V2 - Frontend & Database Enhancements
-# ============================================================
-
-# Day 16 — Upload Validation
-python-magic>=0.4.27
-python-magic-bin>=0.4.14  # Windows support for magic bytes
-
-# Day 20 — JWT Authentication (via Supabase SDK)
-# Already included: supabase==2.4.1
-
-# ============================================================
-# WEEK 1 V2 - High-Fidelity AI Engine Dependencies
-# ============================================================
-
-# ControlNet & Pose Detection
-controlnet-aux>=0.0.7
-mediapipe>=0.10.9
-
-# Face Recognition & Identity Locking
-insightface>=0.7.3
-onnxruntime>=1.16.3
-scikit-learn>=1.3.2
-
-# AnimateDiff & Video Generation
-diffusers>=0.25.0
-transformers>=4.36.2
-accelerate>=0.25.0
-torch>=2.1.2
-torchvision>=0.16.2
-
-# Advanced Image Processing
-albumentations>=1.3.1
-imageio>=2.33.1
-imageio-ffmpeg>=0.4.9
-
-# Scientific Computing
-scipy>=1.11.4
-
-# ============================================================
-# WEEK 4 - Infrastruttura Finanziaria, Sicurezza e Deploy
-# ============================================================
-
-# Day 25-26 — Load Testing
-locust>=2.15.1
-
-# Day 30 — Monitoring
-sentry-sdk>=1.40.0
-
-# ============================================================
-# WEEK 4 - Production Infrastructure Dependencies
-# ============================================================
-
-# Day 25-26: Load Testing
-locust>=2.20.0
-
-# Day 30: Monitoring & Error Tracking
-sentry-sdk>=1.40.0
-
-# Additional production dependencies
-python-magic>=0.4.27  # Already in Week 3, ensure it's present
-
-# ============================================================
-# PHASE 2 SPRINT 1 - Async Processing Infrastructure
-# ============================================================
-
-# Celery & Redis
-celery>=5.3.4
-redis>=5.0.1
-kombu>=5.3.4
-flower>=2.0.1  # Web monitoring UI for Celery
-
-# Additional async utilities
-asyncio-redis>=0.16.0
-
+# Development dependencies (optional)
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0
+# black>=23.0.0
+# mypy>=1.0.0

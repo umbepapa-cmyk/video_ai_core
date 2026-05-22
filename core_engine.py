@@ -36,6 +36,9 @@ from path_config import (
     CARTELLA_VOLTI_RIFERIMENTO_TEST
 )
 
+# Import custom exceptions
+from exceptions import KinematicMismatchError
+
 try:
     import fal_client
 except ImportError:
@@ -84,9 +87,16 @@ class PipelineStage(Enum):
 
 @dataclass
 class CoreEngineConfig:
-    """Configuration for Core Engine."""
-    # Identity settings
-    reference_faces_dir: str
+    """Configuration for Core Engine with Multi-Agent Spatial Conditioning support."""
+    
+    # Identity settings (Multi-Subject Support)
+    # OPTION 1: Single subject (legacy compatibility)
+    reference_faces_dir: Optional[str] = None
+    
+    # OPTION 2: Multi-subject (new Multi-Agent approach)
+    subjects_payload: Optional[Dict[str, str]] = None
+    # Format: {"subject_1": "inputs/donna/", "subject_2": "inputs/uomo/"}
+    
     num_angles: int = 5
     identity_adapter_strength: float = 0.95
     
@@ -116,6 +126,39 @@ class CoreEngineConfig:
     
     # Output settings
     output_path: str = CARTELLA_RISULTATI
+    
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        # Must provide either reference_faces_dir OR subjects_payload
+        if not self.reference_faces_dir and not self.subjects_payload:
+            raise ValueError(
+                "Must provide either 'reference_faces_dir' (single subject) "
+                "or 'subjects_payload' (multi-subject)"
+            )
+        
+        # If both provided, subjects_payload takes precedence
+        if self.reference_faces_dir and self.subjects_payload:
+            logger.warning(
+                "Both reference_faces_dir and subjects_payload provided. "
+                "Using subjects_payload (multi-subject mode)."
+            )
+        
+        # Convert single subject to subjects_payload format for unified handling
+        if self.reference_faces_dir and not self.subjects_payload:
+            self.subjects_payload = {"subject_1": self.reference_faces_dir}
+            logger.info("Converted single subject to subjects_payload format")
+    
+    @property
+    def num_subjects(self) -> int:
+        """Get number of subjects in configuration."""
+        if self.subjects_payload:
+            return len(self.subjects_payload)
+        return 1
+    
+    @property
+    def is_multi_subject(self) -> bool:
+        """Check if this is a multi-subject configuration."""
+        return self.num_subjects > 1
 
 
 @dataclass
@@ -248,13 +291,14 @@ class CoreEngine:
         
         # Initialize sub-engines
         logger.info("Initializing Core Engine components...")
+        logger.info(f"Mode: {'Multi-Subject' if config.is_multi_subject else 'Single-Subject'}")
+        logger.info(f"Subjects: {config.num_subjects}")
         
         self.weights_handler = CustomWeightsHandler() if CustomWeightsHandler else None
         self.controlnet_handler = ControlNetHandler(api_key=self.api_key) if ControlNetHandler else None
-        self.identity_locker = MultiAngleIdentityLock(
-            reference_faces_dir=config.reference_faces_dir,
-            num_angles=config.num_angles
-        ) if MultiAngleIdentityLock else None
+        
+        # Identity locker will be initialized per subject in multi-subject mode
+        self.identity_locker = None
         
         # AnimateDiff engine
         anim_config = AnimateDiffConfig(
@@ -300,8 +344,9 @@ class CoreEngine:
     
     async def generate_high_fidelity_video(
         self,
-        reference_faces_dir: str,
-        prompt: str,
+        reference_faces_dir: Optional[str] = None,
+        subjects_payload: Optional[Dict[str, str]] = None,
+        prompt: str = "",
         controlnet_map_path: Optional[str] = None,
         duration_seconds: int = 10,
         output_path: str = "outputs/"
@@ -309,29 +354,49 @@ class CoreEngine:
         """
         Main entrypoint: Generate high-fidelity video from reference faces.
         
-        This is the primary function that orchestrates the entire Week 1 V2 pipeline.
+        Supports both single-subject and multi-subject (Multi-Agent Spatial Conditioning).
         
         Args:
-            reference_faces_dir: Directory containing reference face images (5 angles)
+            reference_faces_dir: Directory with reference faces (single subject, legacy)
+            subjects_payload: Dict of subject_id -> faces_dir (multi-subject)
+                Example: {"subject_1": "./faces/donna/", "subject_2": "./faces/uomo/"}
             prompt: Text prompt describing desired video content
-            controlnet_map_path: Optional path to ControlNet pose map
+            controlnet_map_path: Optional path to ControlNet pose map (video for multi-subject)
             duration_seconds: Target video duration
             output_path: Directory to save output
             
         Returns:
             GenerationResult with video URL and comprehensive metrics
+        
+        Raises:
+            KinematicMismatchError: If skeleton count != subject count (multi-subject)
         """
         logger.info("\n" + "="*70)
         logger.info("CORE ENGINE: HIGH-FIDELITY VIDEO GENERATION")
         logger.info("="*70)
-        logger.info(f"Reference faces: {reference_faces_dir}")
+        
+        # Determine subjects payload
+        if subjects_payload:
+            final_subjects_payload = subjects_payload
+            logger.info(f"Mode: Multi-Subject ({len(subjects_payload)} subjects)")
+        elif reference_faces_dir:
+            final_subjects_payload = {"subject_1": reference_faces_dir}
+            logger.info(f"Mode: Single-Subject (legacy)")
+        else:
+            raise ValueError("Must provide either reference_faces_dir or subjects_payload")
+        
+        num_subjects = len(final_subjects_payload)
+        
+        for subject_id, faces_dir in final_subjects_payload.items():
+            logger.info(f"  {subject_id}: {faces_dir}")
+        
         logger.info(f"Prompt: {prompt}")
         logger.info(f"Target duration: {duration_seconds}s")
         logger.info(f"Quality: {self.config.quality_preset.value}")
         logger.info("="*70 + "\n")
         
         # Update config
-        self.config.reference_faces_dir = reference_faces_dir
+        self.config.subjects_payload = final_subjects_payload
         self.config.duration_seconds = duration_seconds
         self.config.output_path = output_path
         self.config.controlnet_map_path = controlnet_map_path
@@ -343,32 +408,72 @@ class CoreEngine:
         # Apply negative prompting
         prompts = self._apply_negative_prompts(prompt)
         
+        # Enhance prompt for multi-subject to prevent body entanglement
+        if num_subjects > 1 and self.controlnet_handler:
+            prompts['prompt'] = self.controlnet_handler.prevent_body_entanglement(
+                prompts['prompt'],
+                num_subjects=num_subjects
+            )
+        
         stage1_time = self.progress_tracker.end_stage(PipelineStage.INITIALIZATION)
         
-        # STAGE 2: Identity Extraction
+        # STAGE 2: Identity Extraction (MULTI-SUBJECT)
         self.progress_tracker.start_stage(PipelineStage.IDENTITY_EXTRACTION)
         self._notify_progress(PipelineStage.IDENTITY_EXTRACTION, 2, 7)
         
-        identity_super_vector, stability_score = await self._extract_identity(reference_faces_dir)
+        identity_vectors, stability_scores = await self._extract_identity(final_subjects_payload)
         
         stage2_time = self.progress_tracker.end_stage(PipelineStage.IDENTITY_EXTRACTION)
         
-        # STAGE 3: ControlNet Processing (if enabled)
+        # STAGE 3: ControlNet Processing + Skeleton Detection (if multi-subject)
         self.progress_tracker.start_stage(PipelineStage.CONTROLNET_PROCESSING)
         self._notify_progress(PipelineStage.CONTROLNET_PROCESSING, 3, 7)
         
         controlnet_data = await self._process_controlnet(controlnet_map_path, prompts)
         
+        # Spatial masks for multi-subject
+        spatial_masks = None
+        
+        if num_subjects > 1 and controlnet_map_path and self.controlnet_handler:
+            logger.info("Detecting multiple skeletons for spatial conditioning...")
+            
+            try:
+                spatial_masks = self.controlnet_handler.detect_multiple_skeletons(
+                    video_path=controlnet_map_path,
+                    num_expected_subjects=num_subjects
+                )
+                
+                logger.info(f"✓ Spatial masks generated for {len(spatial_masks)} subjects")
+                
+                # Log first frame positions
+                for subject_id, masks in spatial_masks.items():
+                    if masks:
+                        first_bbox = masks[0]["bbox"]
+                        position = self._bbox_to_position_descriptor(first_bbox)
+                        logger.info(f"  {subject_id}: {position} (bbox: {first_bbox})")
+                
+            except KinematicMismatchError as e:
+                logger.error(f"Kinematic mismatch detected: {e}")
+                logger.error(f"Expected: {e.expected_count} subjects")
+                logger.error(f"Detected: {e.detected_count} skeletons")
+                raise
+            
+            except Exception as e:
+                logger.error(f"Skeleton detection failed: {e}")
+                logger.warning("Continuing without spatial masks (may cause identity bleed)")
+                spatial_masks = None
+        
         stage3_time = self.progress_tracker.end_stage(PipelineStage.CONTROLNET_PROCESSING)
         
-        # STAGE 4: First Frame Generation
+        # STAGE 4: First Frame Generation (MULTI-SUBJECT AWARE)
         self.progress_tracker.start_stage(PipelineStage.FIRST_FRAME_GENERATION)
         self._notify_progress(PipelineStage.FIRST_FRAME_GENERATION, 4, 7)
         
         first_frame_url = await self._generate_first_frame(
-            prompts,
-            identity_super_vector,
-            controlnet_data
+            prompts=prompts,
+            identity_vectors=identity_vectors,
+            spatial_masks=spatial_masks,
+            controlnet_data=controlnet_data
         )
         
         stage4_time = self.progress_tracker.end_stage(PipelineStage.FIRST_FRAME_GENERATION)
@@ -377,19 +482,28 @@ class CoreEngine:
         self.progress_tracker.start_stage(PipelineStage.VIDEO_GENERATION)
         self._notify_progress(PipelineStage.VIDEO_GENERATION, 5, 7)
         
+        # For multi-subject, use the first subject's identity for video generation
+        # (Full multi-subject video generation would require per-frame identity conditioning)
+        primary_subject_id = list(identity_vectors.keys())[0]
+        primary_identity_vector = identity_vectors[primary_subject_id]
+        
+        if num_subjects > 1:
+            logger.info(f"Using {primary_subject_id} identity for video generation")
+            logger.info("Note: Full per-frame multi-subject conditioning requires advanced pipeline")
+        
         if self.config.enable_autoregressive and duration_seconds > self.config.segment_duration:
             # Use autoregressive for longer videos
             video_result = await self._generate_autoregressive_video(
                 first_frame_url,
                 prompts,
-                identity_super_vector
+                primary_identity_vector
             )
         else:
             # Single segment video
             video_result = await self._generate_single_video(
                 first_frame_url,
                 prompts,
-                identity_super_vector,
+                primary_identity_vector,
                 duration_seconds
             )
         
@@ -407,14 +521,17 @@ class CoreEngine:
         self.progress_tracker.start_stage(PipelineStage.COMPLETED)
         self._notify_progress(PipelineStage.COMPLETED, 7, 7)
         
+        # Calculate average stability (for multi-subject)
+        avg_stability = np.mean(list(stability_scores.values())) if stability_scores else 0.0
+        
         # Create result
         result = GenerationResult(
             final_video_url=final_video_url,
             duration_seconds=video_result.get('duration', duration_seconds),
             first_frame_url=first_frame_url,
             last_frame_url=video_result.get('last_frame_url'),
-            identity_super_vector=identity_super_vector,
-            identity_stability_score=stability_score,
+            identity_super_vector=primary_identity_vector,  # Primary subject vector
+            identity_stability_score=avg_stability,
             mean_identity_drift=video_result.get('mean_drift', 0.0),
             temporal_consistency_score=video_result.get('temporal_consistency', 1.0),
             num_segments=video_result.get('num_segments', 1),
@@ -431,7 +548,12 @@ class CoreEngine:
                 'prompt': prompt,
                 'quality_preset': self.config.quality_preset.value,
                 'controlnet_used': self.config.use_controlnet,
-                'autoregressive_used': self.config.enable_autoregressive
+                'autoregressive_used': self.config.enable_autoregressive,
+                'num_subjects': num_subjects,
+                'is_multi_subject': num_subjects > 1,
+                'subjects': list(final_subjects_payload.keys()),
+                'stability_scores': stability_scores,
+                'spatial_conditioning': spatial_masks is not None
             }
         )
         
@@ -458,29 +580,68 @@ class CoreEngine:
                 "negative_prompt": "blurry, deformed, bad anatomy, flickering"
             }
     
-    async def _extract_identity(self, reference_faces_dir: str) -> Tuple[np.ndarray, float]:
-        """Extract multi-angle identity super-vector."""
-        logger.info(f"Extracting identity from {self.config.num_angles} reference angles...")
+    async def _extract_identity(
+        self, 
+        subjects_payload: Dict[str, str]
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+        """
+        Extract multi-angle identity super-vectors for multiple subjects.
         
-        if self.identity_locker:
-            # Extract embeddings from all angles
-            self.identity_locker.extract_multi_angle_embeddings()
+        This method supports Multi-Agent Spatial Conditioning by extracting
+        separate identity embeddings for each subject, preventing Latent Identity Bleed.
+        
+        Args:
+            subjects_payload: Dictionary mapping subject IDs to face directories
+                Example: {"subject_1": "./faces/person_a/", "subject_2": "./faces/person_b/"}
+        
+        Returns:
+            Tuple of:
+            - identity_vectors: Dict mapping subject_id -> super_vector (np.ndarray)
+            - stability_scores: Dict mapping subject_id -> stability score (float)
+        """
+        logger.info(f"Extracting identity from {len(subjects_payload)} subject(s)...")
+        
+        identity_vectors = {}
+        stability_scores = {}
+        
+        for subject_id, faces_dir in subjects_payload.items():
+            logger.info(f"Processing {subject_id} from {faces_dir}")
             
-            # Create super-vector
-            super_vec = self.identity_locker.create_super_vector(fusion_method="weighted_mean")
-            
-            # Calculate stability
-            stability = self.identity_locker.get_identity_stability_score()
-            
-            logger.info(f"Identity extracted with {stability*100:.1f}% stability")
-            
-            return super_vec.vector, stability
-        else:
-            # Fallback mock
-            logger.warning("Identity locker not available, using mock identity")
-            mock_vector = np.random.randn(512).astype(np.float32)
-            mock_vector = mock_vector / np.linalg.norm(mock_vector)
-            return mock_vector, 0.95
+            if MultiAngleIdentityLock:
+                # Reinitialize identity locker for each subject
+                # This ensures complete isolation between subjects
+                self.identity_locker = MultiAngleIdentityLock(
+                    reference_faces_dir=faces_dir,
+                    num_angles=self.config.num_angles
+                )
+                
+                # Extract embeddings
+                self.identity_locker.extract_multi_angle_embeddings()
+                
+                # Create super-vector
+                super_vec = self.identity_locker.create_super_vector(fusion_method="weighted_mean")
+                
+                # Calculate stability
+                stability = self.identity_locker.get_identity_stability_score()
+                
+                identity_vectors[subject_id] = super_vec.vector
+                stability_scores[subject_id] = stability
+                
+                logger.info(f"  {subject_id}: {stability*100:.1f}% stability")
+            else:
+                # Fallback mock for testing
+                logger.warning(f"Identity locker not available, using mock identity for {subject_id}")
+                mock_vector = np.random.randn(512).astype(np.float32)
+                mock_vector = mock_vector / np.linalg.norm(mock_vector)
+                identity_vectors[subject_id] = mock_vector
+                stability_scores[subject_id] = 0.95
+        
+        # Log summary
+        avg_stability = np.mean(list(stability_scores.values())) if stability_scores else 0.0
+        logger.info(f"✓ Identity extraction complete: {len(identity_vectors)} subjects")
+        logger.info(f"  Average stability: {avg_stability*100:.1f}%")
+        
+        return identity_vectors, stability_scores
     
     async def _process_controlnet(
         self,
@@ -515,11 +676,22 @@ class CoreEngine:
     async def _generate_first_frame(
         self,
         prompts: Dict[str, str],
-        identity_vector: np.ndarray,
-        controlnet_data: Optional[Dict[str, Any]]
+        identity_vectors: Dict[str, np.ndarray],  # CHANGED: Dict instead of single vector
+        spatial_masks: Optional[Dict[str, List[Dict]]] = None,  # NEW
+        controlnet_data: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         Generate high-fidelity first frame using Flux.1 Dev with identity injection.
+        
+        Supports Multi-Agent Spatial Conditioning:
+        - Single subject: Uses standard prompt + identity
+        - Multi-subject: Uses regional prompting with spatial position descriptors
+        
+        Args:
+            prompts: Text prompts dict with 'prompt' and optional 'negative_prompt'
+            identity_vectors: Dict mapping subject_id -> identity vector
+            spatial_masks: Optional dict mapping subject_id -> bounding boxes
+            controlnet_data: Optional ControlNet data
         
         Returns:
             URL of the generated image
@@ -532,30 +704,87 @@ class CoreEngine:
         if not self.api_key:
             raise ValueError("FAL_KEY not set in environment or constructor")
         
-        # Prepare payload for Fal.ai
-        payload = {
-            "prompt": prompts.get("prompt", ""),
-            "image_size": "landscape_16_9",  # 16:9 aspect ratio for video
-            "num_inference_steps": 28,
-            "num_images": 1,
-            "enable_safety_checker": False,  # Critical for custom tensors
-            "guidance_scale": 7.5,
-        }
+        num_subjects = len(identity_vectors)
+        logger.info(f"  Subjects: {num_subjects}")
         
-        # Add negative prompting if provided
-        if "negative_prompt" in prompts and prompts["negative_prompt"]:
-            payload["negative_prompt"] = prompts["negative_prompt"]
+        # Determine generation mode
+        if num_subjects == 1:
+            # Single subject - use existing logic
+            logger.info("Using single-subject generation")
+            
+            subject_id = list(identity_vectors.keys())[0]
+            identity_vector = identity_vectors[subject_id]
+            
+            # Prepare payload for Fal.ai
+            payload = {
+                "prompt": prompts.get("prompt", ""),
+                "image_size": "landscape_16_9",  # 16:9 aspect ratio for video
+                "num_inference_steps": 28,
+                "num_images": 1,
+                "enable_safety_checker": False,  # Critical for custom tensors
+                "guidance_scale": 7.5,
+            }
+            
+            # Add negative prompting if provided
+            if "negative_prompt" in prompts and prompts["negative_prompt"]:
+                payload["negative_prompt"] = prompts["negative_prompt"]
+            
+            # Add ControlNet data if available
+            if controlnet_data and "pose_map_path" in controlnet_data:
+                logger.info(f"ControlNet data available but not yet integrated with Flux endpoint")
         
-        # Add ControlNet data if available
-        if controlnet_data and "pose_map_path" in controlnet_data:
-            # Note: ControlNet support depends on Fal.ai endpoint capabilities
-            # This may require a different endpoint like "fal-ai/flux-controlnet"
-            logger.info(f"ControlNet data available but not yet integrated with Flux endpoint")
+        else:
+            # Multi-subject - use regional prompting
+            logger.info(f"Using multi-subject regional prompting for {num_subjects} subjects")
+            
+            # Build regional prompts with spatial descriptors
+            regional_prompts = []
+            
+            for subject_id, identity_vec in identity_vectors.items():
+                # Get spatial position
+                if spatial_masks and subject_id in spatial_masks:
+                    bbox = spatial_masks[subject_id][0]["bbox"]  # First frame
+                    position = self._bbox_to_position_descriptor(bbox)
+                else:
+                    # Fallback positional descriptor based on subject index
+                    subject_num = int(subject_id.split('_')[-1])
+                    if subject_num == 1:
+                        position = "left side"
+                    elif subject_num == num_subjects:
+                        position = "right side"
+                    else:
+                        position = "center"
+                
+                regional_prompts.append(f"{prompts['prompt']} on the {position}")
+            
+            # Combine prompts using pipe separator (regional prompting syntax)
+            combined_prompt = " | ".join(regional_prompts)
+            
+            logger.info(f"Regional prompt: {combined_prompt}")
+            
+            # Prepare payload
+            payload = {
+                "prompt": combined_prompt,
+                "image_size": "landscape_16_9",
+                "num_inference_steps": 28,
+                "num_images": 1,
+                "enable_safety_checker": False,
+                "guidance_scale": 7.5,
+            }
+            
+            # Add negative prompt
+            if "negative_prompt" in prompts and prompts["negative_prompt"]:
+                payload["negative_prompt"] = prompts["negative_prompt"]
+            
+            # Note: Full regional IP-Adapter support depends on Fal.ai endpoint capabilities
+            # This implementation uses prompt-based regional guidance as a fallback
+            logger.info("Note: Using prompt-based regional guidance")
+            logger.info("Full regional IP-Adapter requires specialized endpoint support")
         
         # Define the actual API call as a nested async function for retry
         async def _api_call():
             logger.info(f"Submitting first frame generation to Fal.ai...")
-            logger.info(f"  Prompt: {payload['prompt'][:80]}...")
+            logger.info(f"  Prompt: {payload['prompt'][:100]}...")
             
             # Submit async job to Fal.ai
             handler = await fal_client.submit_async(
@@ -595,6 +824,28 @@ class CoreEngine:
         except Exception as e:
             logger.error(f"First frame generation failed after all retries: {type(e).__name__}: {e}")
             raise RuntimeError(f"Failed to generate first frame: {e}") from e
+    
+    def _bbox_to_position_descriptor(self, bbox: List[float]) -> str:
+        """
+        Convert bounding box to spatial position descriptor for regional prompting.
+        
+        Args:
+            bbox: Bounding box [x, y, w, h] in normalized coordinates
+            
+        Returns:
+            Spatial descriptor string (e.g., "left side", "center", "right side")
+        """
+        x, y, w, h = bbox
+        
+        # Determine horizontal position based on center x coordinate
+        center_x = x + w / 2
+        
+        if center_x < 0.33:
+            return "left side"
+        elif center_x > 0.67:
+            return "right side"
+        else:
+            return "center"
     
     async def _generate_single_video(
         self,
