@@ -447,6 +447,13 @@ class AutoregressiveV2Engine:
             
             segments.append(segment)
             identity_drifts.append(segment.identity_drift)
+            logger.info(
+                "Segment %s added to merge list (post Pass 2): %s",
+                i + 1,
+                segment.video_url[:80] + "..."
+                if len(segment.video_url) > 80
+                else segment.video_url,
+            )
             
             # Update current frame for next segment
             current_frame_url = segment.last_frame_url
@@ -615,12 +622,15 @@ class AutoregressiveV2Engine:
     async def _merge_segments(self, segments: List[VideoSegment]) -> str:
         """
         Merge video segments with FFmpeg.
-        
-        Downloads all segment videos, concatenates them using FFmpeg,
-        and returns the path to the merged video.
+
+        Only segments that completed Pass 2 face-swap are collected in the loop
+        above; this step concatenates those face-swapped outputs (not raw Pass 1).
+        V2V segments are face-swapped per segment in replicate_i2v_provider;
+        I2V autoregressive segments are face-swapped in core_engine._generate_video_segment.
+        Single-segment runs skip merge (len == 1).
         
         Args:
-            segments: List of video segments to merge
+            segments: List of post-Pass-2 video segments to merge
             
         Returns:
             Local path to merged video file

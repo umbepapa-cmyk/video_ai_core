@@ -11,14 +11,17 @@ Pillow>=9.0.0
 # Fal.ai client for video generation
 fal-client>=0.4.0
 
-# Replicate cloud I2V fallback
-replicate>=1.0.0
+# Replicate cloud I2V fallback (Fase 3.5)
+replicate>=0.25.0
 
 # OpenCV for video processing and skeleton detection
 opencv-python>=4.8.0
 
 # FFmpeg Python bindings for dynamic retriever
 ffmpeg-python>=0.2.0
+
+# MediaPipe Pose for canvas padding autodetect (Fase 3.14)
+mediapipe>=0.10.0
 
 # Optional: ControlNet auxiliary for OpenPose detection
 # Install with: pip install controlnet-aux
@@ -33,7 +36,10 @@ ffmpeg-python>=0.2.0
 # torch>=2.0.0
 # torchvision>=0.15.0
 
-# Development dependencies (optional)
+# Optional: InsightFace for real identity embeddings (recommended)
+# pip install insightface onnxruntime
+# insightface>=0.7.3
+# onnxruntime>=1.16.0
 # pytest>=7.0.0
 # pytest-asyncio>=0.21.0
 # black>=23.0.0

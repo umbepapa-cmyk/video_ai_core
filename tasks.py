@@ -24,12 +24,20 @@ from celery_app import celery_app
 
 # Core modules
 from core_engine import generate_high_fidelity_video
+from cost_estimator import (
+    estimate_pipeline_cost,
+    calculate_credit_price,
+    CREDIT_MARKUP_MULTIPLIER,
+)
+from budget_tracker import check_budget
 from database import (
     consume_credits,
     refund_credits,
     supabase_service_role,
-    InsufficientCreditsError
+    InsufficientCreditsError,
+    SupabaseClient,
 )
+from exceptions import BudgetExceededError
 from security_module import (
     EphemeralStorage,
     AgeVerifier,
@@ -78,7 +86,9 @@ class VideoGenerationTask(Task):
         Handles credit refund and cleanup.
         """
         user_id = kwargs.get('user_id')
-        credits_consumed = kwargs.get('credits_consumed', 0)
+        credits_consumed = kwargs.get('credits_consumed', 0) or getattr(
+            self, '_credits_consumed', 0
+        )
         
         logger.error(f"Task {task_id} failed with exception: {exc}")
         logger.error(f"Traceback: {einfo}")
@@ -173,7 +183,78 @@ def generate_video_task(
     
     try:
         # ====================================================================
-        # STAGE 0: Dynamic Motion Reference Retrieval (if motion_keyword provided)
+        # STAGE 0: Unit economics — cost estimate, budget & credits
+        # ====================================================================
+        
+        pipeline_config = {
+            "duration_seconds": duration_seconds,
+            "resolution": "720p",
+            "fps": 24,
+            "endpoint": "fal-ai/wan-i2v",
+            "segment_duration": 5.0,
+            "enable_autoregressive": duration_seconds > 5,
+        }
+        estimate = estimate_pipeline_cost(pipeline_config)
+        credits_required = calculate_credit_price(
+            estimate.total_usd, markup=CREDIT_MARKUP_MULTIPLIER
+        )
+        
+        logger.info(
+            "Pipeline cost estimate: $%.4f USD → %d credits (%d segments)",
+            estimate.total_usd,
+            credits_required,
+            estimate.num_segments,
+        )
+        
+        try:
+            check_budget(estimate.total_usd)
+        except BudgetExceededError as budget_err:
+            logger.error("SAFE MODE: %s", budget_err)
+            return {
+                "status": "error",
+                "error": "budget_exceeded",
+                "status_code": 503,
+                "message": str(budget_err),
+                "task_id": task_id,
+                "user_id": user_id,
+            }
+        
+        if credits_consumed <= 0:
+            try:
+                db_client = SupabaseClient()
+                balance = db_client.get_user_credits_v2(user_id)
+                if balance < credits_required:
+                    raise InsufficientCreditsError(
+                        f"Required {credits_required} credits, available {balance}"
+                    )
+                consume_result = consume_credits(user_id, credits_required, task_id)
+                credits_consumed = credits_required
+                self._credits_consumed = credits_required
+                logger.info(
+                    "Credits consumed: %d (remaining: %s)",
+                    credits_required,
+                    consume_result.get("new_balance", "?"),
+                )
+            except InsufficientCreditsError as credit_err:
+                logger.warning("Insufficient credits for user %s: %s", user_id, credit_err)
+                return {
+                    "status": "error",
+                    "error": "insufficient_credits",
+                    "status_code": 402,
+                    "message": str(credit_err),
+                    "credits_required": credits_required,
+                    "task_id": task_id,
+                    "user_id": user_id,
+                }
+        else:
+            logger.info(
+                "Credits pre-consumed: %d (estimate: %d)",
+                credits_consumed,
+                credits_required,
+            )
+        
+        # ====================================================================
+        # STAGE 1: Dynamic Motion Reference Retrieval (if motion_keyword provided)
         # ====================================================================
         
         if motion_keyword:

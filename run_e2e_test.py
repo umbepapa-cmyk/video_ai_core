@@ -4,7 +4,7 @@ End-to-End Kinematic Integration Test
 =====================================
 
 Valida l'intero flusso architetturale:
-1. Ingestione biometrica (frame extraction da tutti i video + foto in inputs/)
+1. Ingestione biometrica (frame extraction da video + foto in inputs/Soggetto 1/)
 2. Orchestrazione video (core_engine + dynamic retriever opzionale)
 3. Teardown GDPR-compliant
 
@@ -39,7 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-INPUT_DIR = Path("inputs/Soggetto 1")
+INPUT_BASE = Path(__file__).resolve().parent / "inputs"
+INPUT_DIR = INPUT_BASE / "Soggetto 1"
 TEMP_FACES_DIR = Path("tmpfs/test_faces")
 OUTPUT_DIR = Path("outputs/e2e_test")
 
@@ -68,13 +69,15 @@ def get_reference_faces_dir() -> str:
     return str(TEMP_FACES_DIR.resolve())
 
 
-E2E_PROMPT = (
-    "Cinematic sports broadcast tracking shot. Starts with an extreme close-up of the male "
-    "Olympic diver's face showing deep concentration, sweat on his forehead. The camera "
-    "dynamically pulls back and sweeps up to a high-angle top-down view as he gracefully "
-    "leaps off the platform, executing a flawless triple somersault dive into the bright "
-    "blue pool. Photorealistic, 8k resolution, dynamic lighting, professional TV broadcast "
-    "style, ultra-detailed."
+E2E_FIRST_FRAME_PROMPT = (
+    "Extreme close-up macro portrait of the athlete's face looking concentrated before a dive, "
+    "sweat on forehead, blurred background, cinematic lighting, photorealistic"
+)
+E2E_VIDEO_PROMPT = (
+    "Cinematic sports broadcast tracking shot. Camera dynamically pulls back from close-up to "
+    "reveal full body leaping off platform, executing a flawless triple somersault dive into "
+    "the bright blue pool. Photorealistic, 8k resolution, dynamic lighting, professional TV "
+    "broadcast style, ultra-detailed."
 )
 E2E_MOTION_KEYWORD = "olympic diver concentration and platform dive"
 E2E_DURATION_SECONDS = 10
@@ -94,7 +97,7 @@ _test_stats: Dict[str, Any] = {
 
 
 def discover_input_media(input_dir: Path) -> Tuple[List[Path], List[Path]]:
-    """Scan inputs/ recursively for videos and photos."""
+    """Scan subject directory recursively for videos and photos."""
     videos: List[Path] = []
     photos: List[Path] = []
 
@@ -187,7 +190,7 @@ async def setup_phase() -> bool:
         logger.info(f"    - {p.relative_to(INPUT_DIR)}")
 
     if not videos and not photos:
-        logger.error("ERRORE: Nessun video o foto trovato in inputs/")
+        logger.error("ERRORE: Nessun video o foto trovato in %s", INPUT_DIR)
         logger.info("Caricare materiale in inputs/Soggetto 1/ (*.jpg, *.avi)")
         return False
 
@@ -310,7 +313,8 @@ async def fase2_orchestrazione() -> Optional[Dict[str, Any]]:
         subjects_payload = {"subject_1": get_reference_faces_dir()}
 
         logger.info("Parametri generazione:")
-        logger.info(f"  Prompt: {E2E_PROMPT}")
+        logger.info(f"  First-frame prompt: {E2E_FIRST_FRAME_PROMPT}")
+        logger.info(f"  Video prompt: {E2E_VIDEO_PROMPT}")
         logger.info(f"  Motion keyword: {E2E_MOTION_KEYWORD}")
         logger.info(f"  Duration: {E2E_DURATION_SECONDS}s")
         logger.info(f"  Subjects payload: {subjects_payload}")
@@ -347,11 +351,13 @@ async def fase2_orchestrazione() -> Optional[Dict[str, Any]]:
             quality_preset=QualityPreset.HIGH,
             enable_autoregressive=E2E_ENABLE_AUTOREGRESSIVE,
             segment_duration=E2E_SEGMENT_DURATION,
+            identity_adapter_strength=0.95,
         )
         engine = CoreEngine(config=engine_config)
         gen_result = await engine.generate_high_fidelity_video(
             reference_faces_dir=get_reference_faces_dir(),
-            prompt=E2E_PROMPT,
+            prompt=E2E_VIDEO_PROMPT,
+            first_frame_prompt=E2E_FIRST_FRAME_PROMPT,
             controlnet_map_path=controlnet_map_path,
             duration_seconds=E2E_DURATION_SECONDS,
             output_path=str(OUTPUT_DIR),

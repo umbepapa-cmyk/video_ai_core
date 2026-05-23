@@ -44,7 +44,14 @@ from identity_cache import (
 )
 
 # Import custom exceptions
-from exceptions import KinematicMismatchError, BudgetExceededError
+from exceptions import KinematicMismatchError, BudgetExceededError, IdentityConditioningError
+from prompt_sanitizer import apply_gender_routing, sanitize_prompt_dict
+
+from provider_adapters import (
+    apply_identity_conditioning,
+    has_visual_conditioning,
+    log_payload_debug,
+)
 
 from cost_estimator import estimate_pipeline_cost
 from budget_tracker import check_budget, record_spend
@@ -152,6 +159,9 @@ def _normalize_subjects_payload(subjects_payload: Dict[str, str]) -> Dict[str, s
     return {subject_id: _resolve_dir_path(faces_dir) for subject_id, faces_dir in subjects_payload.items()}
 
 
+_REFERENCE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
 class PipelineStage(Enum):
     """Pipeline processing stages."""
     INITIALIZATION = "initialization"
@@ -178,11 +188,22 @@ class CoreEngineConfig:
     
     num_angles: int = 5
     identity_adapter_strength: float = 0.95
+    min_identity_stability: float = 0.50
+    require_identity_stability: bool = False
+    require_reference_face: bool = True
+    enable_post_i2v_face_swap: bool = True
+    subject_gender: Optional[str] = None
+    face_reference_path: Optional[str] = None
     
     # ControlNet settings
     use_controlnet: bool = True
     controlnet_map_path: Optional[str] = None
     controlnet_strength: float = 0.8
+
+    # Kinematic branching (Fase 3.7): motion reference for V2V routing
+    motion_keyword: Optional[str] = None
+    motion_reference_video_path: Optional[str] = None
+    enable_canvas_expansion: bool = False  # Mannheim R&D only — opt-in outpainting prep
     
     # Custom weights settings
     use_custom_checkpoint: bool = False
@@ -207,7 +228,7 @@ class CoreEngineConfig:
     output_path: str = CARTELLA_RISULTATI
 
     # I2V provider: "fal" | "replicate" | "fal_then_replicate"
-    i2v_provider: str = "fal"
+    i2v_provider: str = "fal_then_replicate"
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -387,6 +408,9 @@ class CoreEngine:
         
         self.config = config
         self.api_key = api_key or os.getenv("FAL_KEY")
+        self.replicate_token = os.getenv("REPLICATE_API_TOKEN", "").strip() or None
+        if self.replicate_token in ("", "your_replicate_api_token_here"):
+            self.replicate_token = None
         self.progress_callback = progress_callback
         
         # Initialize sub-engines
@@ -441,9 +465,161 @@ class CoreEngine:
         logger.info(f"  Output directory: {config.output_path}")
         logger.info(f"  Duration target: {config.duration_seconds}s")
         logger.info(f"  Quality preset: {config.quality_preset.value}")
+        logger.info(f"  I2V provider: {config.i2v_provider}")
+        if self.replicate_token:
+            logger.info("  Replicate fallback: configured")
+        else:
+            logger.info("  Replicate fallback: REPLICATE_API_TOKEN not set")
+
+        self._reference_image_url: Optional[str] = None
+        self._face_reference_url: Optional[str] = None
+        self._full_body_reference_url: Optional[str] = None
+
+    def _validate_identity_conditioning(
+        self,
+        payload: Dict[str, Any],
+        identity_vector: Optional[np.ndarray],
+        endpoint: str,
+    ) -> None:
+        """Raise when identity vector is set but no visual reference is in payload."""
+        if identity_vector is not None and not has_visual_conditioning(payload):
+            raise IdentityConditioningError(
+                "identity_vector present but no visual conditioning image in payload "
+                f"(endpoint={endpoint})",
+                endpoint=endpoint,
+            )
+
+    async def _upload_face_reference(self, reference_faces_dir: str) -> str:
+        """
+        Pick the sharpest face crop and upload to Fal CDN for PuLID / embedding.
+
+        Face crops stay in tmpfs for InsightFace only; this uploads the tight
+        crop used as optional secondary conditioning.
+        """
+        from identity_lock_3d import rank_reference_face_images, score_reference_image
+
+        if not fal_client:
+            raise RuntimeError("fal_client not available. Install with: pip install fal-client")
+
+        if self.config.face_reference_path:
+            preferred = Path(self.config.face_reference_path)
+            if preferred.exists():
+                score = score_reference_image(str(preferred))
+                logger.info(
+                    "Using configured face reference: %s (sharpness=%.1f, face_area=%d, conf=%.2f)",
+                    preferred.name,
+                    score.sharpness,
+                    score.face_area,
+                    score.confidence,
+                )
+                uploaded_url = await fal_client.upload_file_async(str(preferred))
+                logger.info("[IDENTITY] Face reference URL for PuLID: %s", uploaded_url[:80])
+                return uploaded_url
+            logger.warning(
+                "Configured face_reference_path missing (%s) — falling back to faces dir",
+                preferred,
+            )
+
+        faces_dir = Path(reference_faces_dir)
+        if not faces_dir.exists():
+            raise FileNotFoundError(f"Reference faces dir not found: {reference_faces_dir}")
+
+        ranked = rank_reference_face_images(
+            reference_faces_dir, top_n=1, require_face=True
+        )
+        best_path = ranked[0]
+        score = score_reference_image(str(best_path))
+        logger.info(
+            "Selected face reference crop: %s (sharpness=%.1f, face_area=%d, conf=%.2f)",
+            best_path.name,
+            score.sharpness,
+            score.face_area,
+            score.confidence,
+        )
+        uploaded_url = await fal_client.upload_file_async(str(best_path))
+        logger.info("[IDENTITY] Face reference URL for PuLID: %s", uploaded_url[:80])
+        return uploaded_url
+
+    async def _upload_best_reference_face(self, reference_faces_dir: str) -> str:
+        """Backward-compatible alias for _upload_face_reference."""
+        return await self._upload_face_reference(reference_faces_dir)
+
+    async def _upload_full_body_reference(self, full_body_image_path: str) -> str:
+        """Upload the best full-body reference image to Fal CDN."""
+        if not fal_client:
+            raise RuntimeError("fal_client not available. Install with: pip install fal-client")
+
+        path = Path(full_body_image_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Full-body reference not found: {full_body_image_path}")
+
+        uploaded_url = await fal_client.upload_file_async(str(path))
+        logger.info("[IDENTITY] Full-body reference URL: %s", uploaded_url[:80])
+        return uploaded_url
+
+    def _resolve_full_body_reference(
+        self,
+        subjects_payload: Dict[str, str],
+    ) -> Optional[str]:
+        """
+        Select the best uncropped full-body image for V2V character replacement.
+
+        Prefers original photos from inputs/ over frame_*.jpg video crops.
+        """
+        from identity_lock_3d import select_best_full_body_image
+
+        primary_subject_id = list(subjects_payload.keys())[0]
+        faces_dir = subjects_payload[primary_subject_id]
+        search_dirs = [faces_dir]
+        parent = Path(faces_dir).parent
+        if parent.exists() and str(parent.resolve()) != str(Path(faces_dir).resolve()):
+            search_dirs.append(str(parent))
+
+        inputs_root = Path("inputs")
+        if inputs_root.exists():
+            for subject_dir in inputs_root.iterdir():
+                if subject_dir.is_dir():
+                    search_dirs.append(str(subject_dir.resolve()))
+
+        try:
+            best = select_best_full_body_image(search_dirs, faces_dir=faces_dir)
+            return str(best.resolve())
+        except ValueError as exc:
+            logger.warning("Full-body reference selection failed: %s", exc)
+            return None
+
+    async def _resolve_character_references(
+        self,
+        subjects_payload: Dict[str, str],
+    ) -> None:
+        """Upload face crop + full-body reference and log character conditioning."""
+        primary_subject_id = list(subjects_payload.keys())[0]
+        primary_faces_dir = subjects_payload[primary_subject_id]
+
+        face_url = await self._upload_face_reference(primary_faces_dir)
+        self._face_reference_url = face_url
+        self._reference_image_url = face_url
+
+        full_body_path = self._resolve_full_body_reference(subjects_payload)
+        if full_body_path:
+            self._full_body_reference_url = await self._upload_full_body_reference(
+                full_body_path
+            )
+        else:
+            self._full_body_reference_url = face_url
+            logger.warning(
+                "No full-body reference found — falling back to face crop for V2V"
+            )
+
+        gen_mode = "v2v" if getattr(self, "_motion_reference_video_path", None) else "i2v"
+        logger.info(
+            "[CHARACTER] face_ref=%s full_body_ref=%s mode=%s",
+            face_url[:80],
+            self._full_body_reference_url[:80],
+            gen_mode,
+        )
 
     def _get_quality_params(self) -> Dict[str, Any]:
-        """Map quality preset to generation parameters (Flux + I2V)."""
         tuning = get_preset_tuning(self.config.quality_preset)
         return {
             "num_inference_steps": tuning["flux_steps"],
@@ -494,13 +670,53 @@ class CoreEngine:
                 logger.warning("Pose map upload skipped: %s", exc)
 
         return controlnet_video_url, pose_map_url
+
+    async def _resolve_motion_reference(
+        self,
+        motion_keyword: Optional[str] = None,
+        explicit_path: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Resolve a local motion-reference video path for V2V kinematic branching.
+
+        Priority: explicit_path/config path > dynamic retriever (motion_keyword).
+        """
+        path = (
+            explicit_path
+            or self.config.motion_reference_video_path
+            or getattr(self, "_motion_reference_video_path", None)
+        )
+        if path and Path(path).exists():
+            logger.info("Motion reference path resolved: %s", path)
+            return path
+
+        keyword = motion_keyword or self.config.motion_keyword
+        if not keyword:
+            return None
+
+        try:
+            from dynamic_retriever import retrieve_motion_reference
+
+            max_duration = int(self.config.duration_seconds or 8)
+            logger.info(
+                "Dynamic Retriever: fetching motion reference for '%s'",
+                keyword,
+            )
+            path = await retrieve_motion_reference(keyword, max_duration=max_duration)
+            logger.info("Motion reference retrieved: %s", path)
+            return path
+        except Exception as exc:
+            logger.warning("Motion reference retrieval failed: %s", exc)
+            return None
     
     async def generate_high_fidelity_video(
         self,
         reference_faces_dir: Optional[str] = None,
         subjects_payload: Optional[Dict[str, str]] = None,
         prompt: str = "",
+        first_frame_prompt: Optional[str] = None,
         controlnet_map_path: Optional[str] = None,
+        motion_keyword: Optional[str] = None,
         duration_seconds: int = 10,
         output_path: str = "outputs/"
     ) -> GenerationResult:
@@ -513,7 +729,8 @@ class CoreEngine:
             reference_faces_dir: Directory with reference faces (single subject, legacy)
             subjects_payload: Dict of subject_id -> faces_dir (multi-subject)
                 Example: {"subject_1": "./faces/donna/", "subject_2": "./faces/uomo/"}
-            prompt: Text prompt describing desired video content
+            prompt: Text prompt for I2V video motion (full cinematic sequence)
+            first_frame_prompt: Optional separate prompt for Flux first-frame close-up
             controlnet_map_path: Optional path to ControlNet pose map (video for multi-subject)
             duration_seconds: Target video duration
             output_path: Directory to save output
@@ -544,6 +761,8 @@ class CoreEngine:
             logger.info(f"  {subject_id}: {faces_dir}")
         
         logger.info(f"Prompt: {prompt}")
+        if first_frame_prompt:
+            logger.info(f"First-frame prompt (Flux): {first_frame_prompt}")
         logger.info(f"Target duration: {duration_seconds}s")
         logger.info(f"Quality: {self.config.quality_preset.value}")
         logger.info("="*70 + "\n")
@@ -582,14 +801,57 @@ class CoreEngine:
         self.config.duration_seconds = duration_seconds
         self.config.output_path = output_path
         self.config.controlnet_map_path = controlnet_map_path
+        if motion_keyword:
+            self.config.motion_keyword = motion_keyword
+
+        motion_reference_path = await self._resolve_motion_reference(
+            motion_keyword=motion_keyword,
+            explicit_path=controlnet_map_path,
+        )
+        self._canvas_expanded = False
+        self._canvas_padding = {
+            "padding_top": 0.0,
+            "padding_bottom": 0.0,
+            "padding_left": 0.0,
+            "padding_right": 0.0,
+        }
+        if motion_reference_path and self.config.enable_canvas_expansion:
+            from canvas_expander import detect_required_padding, expand_video_canvas
+
+            padding = detect_required_padding(Path(motion_reference_path))
+            self._canvas_padding = padding
+            expanded_path = await expand_video_canvas(motion_reference_path, **padding)
+            motion_reference_path = str(expanded_path)
+            self._canvas_expanded = any(v > 0 for v in padding.values())
+            if self._canvas_expanded:
+                logger.info(
+                    "Canvas expanded for V2V outpainting (padding=%s): %s",
+                    padding,
+                    motion_reference_path,
+                )
+
+        self._motion_reference_video_path = motion_reference_path
+        if motion_reference_path:
+            self.config.motion_reference_video_path = motion_reference_path
+            logger.info(
+                "V2V kinematic branch armed with motion reference: %s",
+                motion_reference_path,
+            )
         
         # STAGE 1: Initialization
         self.progress_tracker.start_stage(PipelineStage.INITIALIZATION)
         self._notify_progress(PipelineStage.INITIALIZATION, 1, 7)
         
-        # Apply negative prompting
+        # Apply negative prompting + gender-neutral sanitization
         prompts = self._apply_negative_prompts(prompt)
-        
+        if first_frame_prompt:
+            prompts["first_frame_prompt"] = first_frame_prompt
+        prompts = sanitize_prompt_dict(
+            prompts, subject_gender=self.config.subject_gender
+        )
+        if self.config.subject_gender:
+            prompts = apply_gender_routing(prompts, self.config.subject_gender)
+
         # Enhance prompt for multi-subject to prevent body entanglement
         if num_subjects > 1 and self.controlnet_handler:
             prompts['prompt'] = self.controlnet_handler.prevent_body_entanglement(
@@ -650,6 +912,9 @@ class CoreEngine:
                 spatial_masks = None
         
         stage3_time = self.progress_tracker.end_stage(PipelineStage.CONTROLNET_PROCESSING)
+        
+        # Resolve face + full-body references before first frame (Fase 3.8)
+        await self._resolve_character_references(final_subjects_payload)
         
         # STAGE 4: First Frame Generation (MULTI-SUBJECT AWARE)
         self.progress_tracker.start_stage(PipelineStage.FIRST_FRAME_GENERATION)
@@ -727,6 +992,28 @@ class CoreEngine:
         # STAGE 6: Finalization
         self.progress_tracker.start_stage(PipelineStage.FINALIZATION)
         self._notify_progress(PipelineStage.FINALIZATION, 6, 7)
+
+        is_autoregressive = (
+            self.config.enable_autoregressive
+            and self.config.duration_seconds > self.config.segment_duration
+        )
+        if (
+            self.config.enable_post_i2v_face_swap
+            and not is_autoregressive
+            and self.replicate_token
+            and self._reference_image_url
+            and video_result.get("video_url", "").startswith("http")
+        ):
+            from replicate_i2v_provider import apply_replicate_face_swap
+
+            logger.info("[INIZIO PASS 2] Invio a Face-Swap API...")
+            swapped_url = await apply_replicate_face_swap(
+                video_result["video_url"],
+                self._reference_image_url,
+                replicate_token=self.replicate_token,
+            )
+            logger.info("[PASS 2 COMPLETO] URL=%s", swapped_url)
+            video_result["video_url"] = swapped_url
         
         final_video_url = await self._finalize_video(video_result, output_path)
         
@@ -829,17 +1116,27 @@ class CoreEngine:
             cached = load_cached_identity(cache_hash)
             if cached is not None:
                 super_vec, stability, _meta = cached
-                identity_vectors[subject_id] = super_vec
-                stability_scores[subject_id] = stability
-                logger.info(f"  {subject_id}: {stability*100:.1f}% stability (cached)")
-                continue
+                if stability < self.config.min_identity_stability:
+                    logger.warning(
+                        "  %s: cached stability %.1f%% below threshold — re-extracting",
+                        subject_id,
+                        stability * 100,
+                    )
+                    from identity_cache import invalidate_cache
+
+                    invalidate_cache(cache_hash)
+                else:
+                    identity_vectors[subject_id] = super_vec
+                    stability_scores[subject_id] = stability
+                    logger.info(f"  {subject_id}: {stability*100:.1f}% stability (cached)")
+                    continue
             
             if MultiAngleIdentityLock:
-                # Reinitialize identity locker for each subject
-                # This ensures complete isolation between subjects
                 self.identity_locker = MultiAngleIdentityLock(
                     reference_faces_dir=faces_dir,
-                    num_angles=self.config.num_angles
+                    num_angles=self.config.num_angles,
+                    min_stability=self.config.min_identity_stability,
+                    fail_on_low_stability=self.config.require_identity_stability,
                 )
                 
                 # Extract embeddings
@@ -868,6 +1165,14 @@ class CoreEngine:
                 )
                 
                 logger.info(f"  {subject_id}: {stability*100:.1f}% stability")
+                if stability < self.config.min_identity_stability:
+                    logger.warning(
+                        "[IDENTITY] %s stability %.1f%% < %.0f%% — "
+                        "reference photos may be inconsistent or missing faces",
+                        subject_id,
+                        stability * 100,
+                        self.config.min_identity_stability * 100,
+                    )
             else:
                 # Fallback mock for testing
                 logger.warning(f"Identity locker not available, using mock identity for {subject_id}")
@@ -913,186 +1218,196 @@ class CoreEngine:
             logger.warning("ControlNet handler not available")
             return None
     
+    async def _generate_first_frame_instantid(
+        self,
+        prompt: str,
+        reference_image_url: str,
+        *,
+        negative_prompt: str = "",
+        timeout: int = 120,
+    ) -> str:
+        """InstantID fallback when flux-pulid fails."""
+        payload: Dict[str, Any] = {
+            "face_image_url": reference_image_url,
+            "prompt": prompt,
+            "enable_safety_checker": False,
+        }
+        if negative_prompt:
+            payload["negative_prompt"] = negative_prompt
+        endpoint = "fal-ai/instantid"
+        log_payload_debug(endpoint, payload)
+        logger.info("[IDENTITY] InstantID fallback for first frame...")
+        handler = await fal_client.submit_async(endpoint, arguments=payload)
+        result = await submit_and_wait_with_eta(
+            handler, 45.0, "InstantID first frame", timeout=timeout
+        )
+        image = result.get("image") or {}
+        image_url = image.get("url") if isinstance(image, dict) else None
+        if not image_url and result.get("images"):
+            image_url = result["images"][0].get("url")
+        if not image_url:
+            raise ValueError("InstantID returned no image URL")
+        return image_url
+
     async def _generate_first_frame(
         self,
         prompts: Dict[str, str],
-        identity_vectors: Dict[str, np.ndarray],  # CHANGED: Dict instead of single vector
-        spatial_masks: Optional[Dict[str, List[Dict]]] = None,  # NEW
+        identity_vectors: Dict[str, np.ndarray],
+        spatial_masks: Optional[Dict[str, List[Dict]]] = None,
         controlnet_data: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Generate high-fidelity first frame using Flux.1 Dev with identity injection.
-        
-        Supports Multi-Agent Spatial Conditioning:
-        - Single subject: Uses standard prompt + identity
-        - Multi-subject: Uses regional prompting with spatial position descriptors
-        
-        Args:
-            prompts: Text prompts dict with 'prompt' and optional 'negative_prompt'
-            identity_vectors: Dict mapping subject_id -> identity vector
-            spatial_masks: Optional dict mapping subject_id -> bounding boxes
-            controlnet_data: Optional ControlNet data
-        
-        Returns:
-            URL of the generated image
+        Generate first frame with mandatory PuLID identity injection.
+
+        Wan/Hunyuan I2V carry identity ONLY via ``image_url`` (this first frame).
+        A reference face URL is required — generic flux/dev without PuLID is rejected.
         """
-        logger.info("Generating high-fidelity first frame with Flux.1 Dev...")
-        
+        logger.info("Generating high-fidelity first frame with PuLID identity lock...")
+
         if not fal_client:
             raise RuntimeError("fal_client not available. Install with: pip install fal-client")
-        
+
         if not self.api_key:
             raise ValueError("FAL_KEY not set in environment or constructor")
 
         quality = self._get_quality_params()
-        
         num_subjects = len(identity_vectors)
-        logger.info(f"  Subjects: {num_subjects}")
-        
-        # Determine generation mode
+        flux_prompt = prompts.get("first_frame_prompt") or prompts.get("prompt", "")
+        primary_subject_id = list(identity_vectors.keys())[0]
+        primary_identity_vector = identity_vectors[primary_subject_id]
+        adapter_strength = self.config.identity_adapter_strength
+
+        reference_image_url: Optional[str] = self._face_reference_url
+        if not reference_image_url and self.config.subjects_payload:
+            primary_faces_dir = self.config.subjects_payload.get(primary_subject_id)
+            if primary_faces_dir:
+                reference_image_url = await self._upload_face_reference(
+                    primary_faces_dir
+                )
+                self._face_reference_url = reference_image_url
+                self._reference_image_url = reference_image_url
+
+        if self.config.require_reference_face and not reference_image_url:
+            raise IdentityConditioningError(
+                "No reference face URL — cannot generate identity-locked first frame. "
+                "Ensure inputs contain photos with detectable faces.",
+                endpoint="fal-ai/flux-pulid",
+            )
+
         if num_subjects == 1:
-            # Single subject - use existing logic
-            logger.info("Using single-subject generation")
-            
-            subject_id = list(identity_vectors.keys())[0]
-            identity_vector = identity_vectors[subject_id]
-            
-            # Prepare payload for Fal.ai
-            payload = {
-                "prompt": prompts.get("prompt", ""),
-                "image_size": quality["image_size"],
-                "num_inference_steps": quality["num_inference_steps"],
-                "num_images": 1,
-                "enable_safety_checker": False,  # Critical for custom tensors
-                "guidance_scale": quality["guidance_scale"],
-            }
-            
-            # Add negative prompting if provided
-            if "negative_prompt" in prompts and prompts["negative_prompt"]:
-                payload["negative_prompt"] = prompts["negative_prompt"]
-            
-            # Add ControlNet data if available
-            if controlnet_data and "pose_map_path" in controlnet_data:
-                logger.info(f"ControlNet data available but not yet integrated with Flux endpoint")
-        
-        else:
-            # Multi-subject - use regional prompting
-            logger.info(f"Using multi-subject regional prompting for {num_subjects} subjects")
-            
-            # Build regional prompts with spatial descriptors
-            regional_prompts = []
-            
-            for subject_id, identity_vec in identity_vectors.items():
-                # Get spatial position
-                if spatial_masks and subject_id in spatial_masks:
-                    bbox = spatial_masks[subject_id][0]["bbox"]  # First frame
-                    position = self._bbox_to_position_descriptor(bbox)
-                else:
-                    # Fallback positional descriptor based on subject index
-                    subject_num = int(subject_id.split('_')[-1])
-                    if subject_num == 1:
-                        position = "left side"
-                    elif subject_num == num_subjects:
-                        position = "right side"
-                    else:
-                        position = "center"
-                
-                regional_prompts.append(f"{prompts['prompt']} on the {position}")
-            
-            # Combine prompts using pipe separator (regional prompting syntax)
-            combined_prompt = " | ".join(regional_prompts)
-            
-            logger.info(f"Regional prompt: {combined_prompt}")
-            
-            # Prepare payload
-            payload = {
-                "prompt": combined_prompt,
+            payload: Dict[str, Any] = {
+                "prompt": flux_prompt,
                 "image_size": quality["image_size"],
                 "num_inference_steps": quality["num_inference_steps"],
                 "num_images": 1,
                 "enable_safety_checker": False,
                 "guidance_scale": quality["guidance_scale"],
             }
-            
-            # Add negative prompt
-            if "negative_prompt" in prompts and prompts["negative_prompt"]:
-                payload["negative_prompt"] = prompts["negative_prompt"]
-            
-            # Note: Full regional IP-Adapter support depends on Fal.ai endpoint capabilities
-            # This implementation uses prompt-based regional guidance as a fallback
-            logger.info("Note: Using prompt-based regional guidance")
-            logger.info("Full regional IP-Adapter requires specialized endpoint support")
-        
-        # Define the actual API call as a nested async function for retry
+        else:
+            regional_prompts = []
+            for subject_id in identity_vectors:
+                if spatial_masks and subject_id in spatial_masks:
+                    bbox = spatial_masks[subject_id][0]["bbox"]
+                    position = self._bbox_to_position_descriptor(bbox)
+                else:
+                    subject_num = int(subject_id.split("_")[-1])
+                    if subject_num == 1:
+                        position = "left side"
+                    elif subject_num == num_subjects:
+                        position = "right side"
+                    else:
+                        position = "center"
+                regional_prompts.append(f"{flux_prompt} on the {position}")
+            payload = {
+                "prompt": " | ".join(regional_prompts),
+                "image_size": quality["image_size"],
+                "num_inference_steps": quality["num_inference_steps"],
+                "num_images": 1,
+                "enable_safety_checker": False,
+                "guidance_scale": quality["guidance_scale"],
+            }
+
+        if prompts.get("negative_prompt"):
+            payload["negative_prompt"] = prompts["negative_prompt"]
+
+        if controlnet_data and "pose_map_path" in controlnet_data:
+            logger.info("ControlNet data available but not yet integrated with Flux endpoint")
+
+        payload["reference_image_url"] = reference_image_url
+        payload["id_weight"] = adapter_strength
+        if self._full_body_reference_url:
+            payload["image_prompt"] = self._full_body_reference_url
+        apply_identity_conditioning(
+            payload,
+            identity_vector=None,
+            reference_image_url=reference_image_url,
+            identity_adapter_strength=adapter_strength,
+        )
+
+        flux_endpoint = "fal-ai/flux-pulid"
+        self._validate_identity_conditioning(
+            payload, primary_identity_vector, flux_endpoint
+        )
+
         obfuscation_attempted = False
 
-        async def _api_call():
+        async def _pulid_call() -> str:
             nonlocal obfuscation_attempted
-            logger.info("Submitting first frame generation to Fal.ai...")
-            logger.info("  Prompt: %s...", payload["prompt"][:100])
-
-            handler = await fal_client.submit_async(
-                "fal-ai/flux/dev",
-                arguments=payload,
-            )
-
-            first_frame_timeout = quality["first_frame_timeout"]
-            draft_mode = self.config.quality_preset == QualityPreset.DRAFT
-            estimated = estimate_first_frame_seconds(draft_mode=draft_mode)
-            logger.info(
-                "Waiting for first frame generation (timeout: %ss)...",
-                first_frame_timeout,
-            )
+            logger.info("[IDENTITY] Submitting PuLID first frame (%s)...", flux_endpoint)
+            log_payload_debug(flux_endpoint, payload)
+            handler = await fal_client.submit_async(flux_endpoint, arguments=payload)
             try:
                 result = await submit_and_wait_with_eta(
                     handler,
-                    estimated,
-                    "First frame Flux",
-                    timeout=first_frame_timeout,
-                    step_info="step 1/1 first frame",
+                    estimate_first_frame_seconds(
+                        draft_mode=self.config.quality_preset == QualityPreset.DRAFT
+                    ),
+                    "First frame PuLID",
+                    timeout=quality["first_frame_timeout"],
+                    step_info="step 1/1 PuLID first frame",
                 )
             except Exception as exc:
                 if self._is_content_policy_error(exc) and not obfuscation_attempted:
-                    logger.warning(
-                        "[WARNING] Server-side policy filter triggered. "
-                        "Initiating Prompt Obfuscation..."
-                    )
                     payload["prompt"] = self._obfuscate_prompt(payload["prompt"])
                     if payload.get("negative_prompt"):
                         payload["negative_prompt"] = self._obfuscate_prompt(
                             payload["negative_prompt"]
                         )
                     obfuscation_attempted = True
-                    return await _api_call()
+                    return await _pulid_call()
                 raise
 
             images = result.get("images", [])
             if not images:
-                raise ValueError("No images returned from Flux.1 Dev")
-
+                raise ValueError(f"No images returned from {flux_endpoint}")
             image_url = images[0].get("url")
             if not image_url:
-                raise ValueError("Image URL not found in response")
-
-            logger.info("✓ First frame generated successfully")
-            logger.info("  URL: %s", image_url)
-
+                raise ValueError("Image URL not found in PuLID response")
+            logger.info("[IDENTITY] PuLID first frame URL: %s", image_url)
             return image_url
 
-        # Execute with retry logic
         try:
-            image_url = await retry_with_backoff(
-                _api_call,
-                max_retries=3,
+            return await retry_with_backoff(
+                _pulid_call,
+                max_retries=2,
                 initial_delay=2.0,
                 backoff_factor=2.0,
-                exceptions=(httpx.HTTPError, asyncio.TimeoutError, ValueError, RuntimeError)
+                exceptions=(httpx.HTTPError, asyncio.TimeoutError, ValueError, RuntimeError),
             )
-            return image_url
-            
-        except Exception as e:
-            logger.error(f"First frame generation failed after all retries: {type(e).__name__}: {e}")
-            raise RuntimeError(f"Failed to generate first frame: {e}") from e
+        except Exception as pulid_exc:
+            logger.warning("PuLID first frame failed: %s — trying InstantID fallback", pulid_exc)
+            try:
+                return await self._generate_first_frame_instantid(
+                    flux_prompt,
+                    reference_image_url,
+                    negative_prompt=payload.get("negative_prompt", ""),
+                    timeout=quality["first_frame_timeout"],
+                )
+            except Exception as instantid_exc:
+                logger.error("InstantID fallback failed: %s", instantid_exc)
+                raise RuntimeError(
+                    f"Identity first frame failed (PuLID + InstantID): {pulid_exc}"
+                ) from instantid_exc
     
     def _bbox_to_position_descriptor(self, bbox: List[float]) -> str:
         """
@@ -1147,6 +1462,7 @@ class CoreEngine:
             controlnet_video_url, pose_map_url = getattr(
                 self, "_controlnet_urls", (None, None)
             )
+            motion_reference_path = getattr(self, "_motion_reference_video_path", None)
             result = await self.animatediff_engine.generate_cinematic_video(
                 prompt=prompts['prompt'],
                 first_frame_url=first_frame_url,
@@ -1166,6 +1482,15 @@ class CoreEngine:
                     "controlnet_video_url": controlnet_video_url,
                     "pose_map_url": pose_map_url,
                     "identity_adapter_strength": self.config.identity_adapter_strength,
+                    "motion_reference_video_path": motion_reference_path,
+                    "i2v_provider": getattr(self.config, "i2v_provider", "fal_then_replicate"),
+                    "provider": getattr(self.config, "i2v_provider", "fal_then_replicate"),
+                    "replicate_token": self.replicate_token,
+                    "reference_image_url": self._full_body_reference_url or self._face_reference_url,
+                    "face_reference_url": self._face_reference_url,
+                    "full_body_reference_url": self._full_body_reference_url,
+                    "ip_adapter_image": self._full_body_reference_url or self._face_reference_url,
+                    "subject_gender": self.config.subject_gender,
                 },
             )
             
@@ -1181,7 +1506,8 @@ class CoreEngine:
         if not self.api_key:
             raise ValueError("FAL_KEY not set in environment or constructor")
 
-        from i2v_router import generate_i2v_with_fallback
+        from i2v_router import generate_video_with_fallback
+        from prompt_enhancement import inject_body_consistency_prompt
 
         motion_preset = (
             self.config.motion_preset if hasattr(self.config, "motion_preset") else "smooth"
@@ -1189,21 +1515,38 @@ class CoreEngine:
         fps = self.config.fps if hasattr(self.config, "fps") else 24
         quality = self._get_quality_params()
         controlnet_video_url, pose_map_url = getattr(self, "_controlnet_urls", (None, None))
+        motion_reference_path = getattr(self, "_motion_reference_video_path", None)
+        gen_mode = "v2v" if motion_reference_path else "i2v"
+        video_prompt = inject_body_consistency_prompt(
+            prompts.get("prompt", ""), mode=gen_mode
+        )
 
         async def _api_call():
-            logger.info("Submitting video generation via I2V fallback router...")
-            logger.info(f"  First frame: {first_frame_url}")
+            logger.info("[IDENTITY] First frame URL for I2V: %s", first_frame_url)
+            logger.info(
+                "[CHARACTER] face_ref=%s full_body_ref=%s mode=%s",
+                (self._face_reference_url or "")[:80],
+                (self._full_body_reference_url or "")[:80],
+                gen_mode,
+            )
+            logger.info(
+                "[IDENTITY] Wan/Hunyuan I2V uses image_url only — "
+                "identity_vector JSON is ignored by these endpoints"
+            )
+            logger.info("Submitting video generation via I2V/V2V fallback router...")
             logger.info(f"  Duration: {duration}s")
             logger.info(f"  Motion preset: {motion_preset}")
             logger.info(f"  Resolution: {quality['resolution']}")
             logger.info(f"  I2V steps: {quality['i2v_inference_steps']}")
+            if motion_reference_path:
+                logger.info("  Motion reference (V2V): %s", motion_reference_path)
             if controlnet_video_url:
                 logger.info("  ControlNet video conditioning: enabled")
             if pose_map_url:
                 logger.info("  Pose map conditioning: enabled")
-            return await generate_i2v_with_fallback(
+            return await generate_video_with_fallback(
                 image_url=first_frame_url,
-                prompt=prompts.get("prompt", ""),
+                prompt=video_prompt,
                 duration=duration,
                 negative_prompt=prompts.get("negative_prompt", ""),
                 motion_preset=motion_preset,
@@ -1213,16 +1556,24 @@ class CoreEngine:
                 draft_mode=self.config.quality_preset == QualityPreset.DRAFT,
                 require_last_frame=self.config.enable_autoregressive,
                 api_key=self.api_key,
-                provider=getattr(self.config, "i2v_provider", "fal"),
+                provider=getattr(self.config, "i2v_provider", "fal_then_replicate"),
+                replicate_token=self.replicate_token,
                 stage_label=stage_label,
                 segment_index=segment_index,
                 segment_total=segment_total,
                 on_progress=on_progress,
                 identity_vector=identity_vector,
                 identity_adapter_strength=self.config.identity_adapter_strength,
+                reference_image_url=self._full_body_reference_url or self._face_reference_url,
+                face_reference_url=self._face_reference_url,
+                full_body_reference_url=self._full_body_reference_url,
+                ip_adapter_image=self._full_body_reference_url or self._face_reference_url,
                 controlnet_video_url=controlnet_video_url,
                 pose_map_url=pose_map_url,
                 num_inference_steps=quality["i2v_inference_steps"],
+                motion_reference_video_path=motion_reference_path,
+                canvas_expanded=getattr(self, "_canvas_expanded", False),
+                canvas_padding=getattr(self, "_canvas_padding", None),
             )
 
         try:
@@ -1329,6 +1680,8 @@ class CoreEngine:
         
         if not video_url:
             raise ValueError("Video URL not returned from generation")
+
+        video_url = await self._apply_mandatory_segment_face_swap(video_url)
         
         if not last_frame_url:
             from i2v_router import ensure_last_frame_url
@@ -1337,10 +1690,35 @@ class CoreEngine:
                 video_url, None, self.api_key
             )
         
-        logger.info("✓ Segment generated for autoregressive loop")
+        logger.info("✓ Segment generated for autoregressive loop (post Pass 2)")
         logger.info("  last_frame_url ready for next segment propagation")
         
         return video_url, last_frame_url
+
+    async def _apply_mandatory_segment_face_swap(self, video_url: str) -> str:
+        """Pass 2 per autoregressive segment."""
+        if not self.config.enable_post_i2v_face_swap:
+            return video_url
+
+        if not video_url.startswith("http"):
+            return video_url
+
+        if not self.replicate_token or not self._reference_image_url:
+            raise IdentityConditioningError(
+                "[PASS 2 CRITICAL] Missing Replicate token or reference face URL "
+                "for autoregressive segment face-swap"
+            )
+
+        from replicate_i2v_provider import apply_replicate_face_swap
+
+        logger.info("[INIZIO PASS 2] Invio a Face-Swap API...")
+        swapped_url = await apply_replicate_face_swap(
+            video_url,
+            self._reference_image_url,
+            replicate_token=self.replicate_token,
+        )
+        logger.info("[PASS 2 COMPLETO] URL=%s", swapped_url)
+        return swapped_url
     
     async def _finalize_video(self, video_result: Dict[str, Any], output_path: str) -> str:
         """
@@ -1481,8 +1859,10 @@ async def generate_high_fidelity_video(
     reference_faces_dir: str,
     prompt: str,
     controlnet_map_path: Optional[str] = None,
+    motion_keyword: Optional[str] = None,
     duration_seconds: int = 10,
-    output_path: str = "outputs/"
+    output_path: str = "outputs/",
+    first_frame_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main convenience function for high-fidelity video generation.
@@ -1505,6 +1885,7 @@ async def generate_high_fidelity_video(
         duration_seconds=duration_seconds,
         output_path=output_path,
         controlnet_map_path=controlnet_map_path,
+        motion_keyword=motion_keyword,
         quality_preset=QualityPreset.HIGH
     )
     
@@ -1513,7 +1894,9 @@ async def generate_high_fidelity_video(
     result = await engine.generate_high_fidelity_video(
         reference_faces_dir=reference_faces_dir,
         prompt=prompt,
+        first_frame_prompt=first_frame_prompt,
         controlnet_map_path=controlnet_map_path,
+        motion_keyword=motion_keyword,
         duration_seconds=duration_seconds,
         output_path=output_path
     )
