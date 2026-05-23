@@ -25,17 +25,14 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
 
+from exceptions import InsufficientCreditsError
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class DatabaseError(Exception):
     """Exception for database-related errors."""
-    pass
-
-
-class InsufficientCreditsError(DatabaseError):
-    """Exception raised when user has insufficient credits."""
     pass
 
 

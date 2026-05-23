@@ -174,3 +174,49 @@ class SpatialMaskingError(Exception):
         super().__init__(message)
         self.subject_id = subject_id
         self.frame_index = frame_index
+
+
+class BudgetExceededError(Exception):
+    """
+    Raised when a generation job would exceed the daily API budget.
+
+    Triggers Safe Mode: no further Fal.ai calls until UTC midnight reset.
+    """
+
+    def __init__(self, message: str = "Daily API budget exceeded"):
+        super().__init__(message)
+
+
+class InsufficientCreditsError(Exception):
+    """Raised when a user does not have enough credits for a job."""
+
+    def __init__(self, message: str = "Insufficient credits"):
+        super().__init__(message)
+
+
+class SystemEnvironmentError(Exception):
+    """Raised when a required system dependency is missing or misconfigured."""
+
+    def __init__(self, message: str = "Required system dependency not available"):
+        super().__init__(message)
+
+
+class IdentityConditioningError(Exception):
+    """
+    Raised when an identity vector is present but no visual conditioning image
+    was included in the API payload (IP-Adapter / PuLID / reference_image_url).
+
+    Without a reference image URL the provider cannot lock face identity and
+    generation would fall back to generic appearance.
+    """
+
+    def __init__(
+        self,
+        message: str = (
+            "identity_vector present but no visual conditioning image in payload "
+            "(reference_image_url / ip_adapter_image / image_url required)"
+        ),
+        endpoint: str = None,
+    ):
+        super().__init__(message)
+        self.endpoint = endpoint
