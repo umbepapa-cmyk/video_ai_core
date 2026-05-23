@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -45,7 +46,7 @@ MOTION_STRENGTH_MAP = {
 
 @dataclass
 class I2VContext:
-    """Inputs shared across all I2V provider adapters."""
+    """Inputs shared across all I2V/V2V provider adapters."""
 
     image_url: str
     prompt: str
@@ -62,9 +63,38 @@ class I2VContext:
     on_progress: Optional[ProgressCallback] = field(default=None, repr=False)
     identity_vector: Optional[np.ndarray] = field(default=None, repr=False)
     identity_adapter_strength: float = 0.95
+    reference_image_url: Optional[str] = None
+    face_reference_url: Optional[str] = None
+    full_body_reference_url: Optional[str] = None
+    ip_adapter_image: Optional[str] = None
     controlnet_video_url: Optional[str] = None
     pose_map_url: Optional[str] = None
     num_inference_steps: Optional[int] = None
+    motion_reference_video_path: Optional[str] = None
+    motion_reference_video_url: Optional[str] = None
+    canvas_expanded: bool = False
+    canvas_padding: Optional[Dict[str, float]] = None
+
+    @property
+    def generation_mode(self) -> Literal["i2v", "v2v"]:
+        if self.motion_reference_video_path or self.motion_reference_video_url:
+            return "v2v"
+        return "i2v"
+
+
+# Alias for kinematic branching (Fase 3.7).
+VideoGenContext = I2VContext
+
+
+def resolve_generation_mode(ctx: I2VContext) -> Literal["i2v", "v2v"]:
+    """Return auto-derived generation mode and log routing decision."""
+    mode = ctx.generation_mode
+    if mode == "v2v":
+        ref = ctx.motion_reference_video_url or ctx.motion_reference_video_path
+        logger.info("[ROUTER] Modalità V2V attivata. Reference video: %s", ref)
+    else:
+        logger.info("[ROUTER] Modalità I2V attivata.")
+    return mode
 
 
 @dataclass
@@ -92,11 +122,17 @@ def motion_strength_for_preset(preset: str, default: float = 0.6) -> float:
 
 
 def _apply_conditioning(payload: Dict[str, Any], ctx: I2VContext) -> Dict[str, Any]:
-    """Attach identity / ControlNet fields supported by Fal I2V endpoints."""
-    if ctx.identity_vector is not None:
-        payload["identity_vector"] = ctx.identity_vector.tolist()
-        payload["identity_adapter_strength"] = ctx.identity_adapter_strength
-        payload["lock_identity_all_frames"] = True
+    """
+    Attach ControlNet / inference fields for Fal I2V endpoints.
+
+    Identity note: Wan, Hunyuan, Kling, and Luma I2V do NOT consume
+    ``identity_vector`` or ``reference_image_url`` JSON fields. Visual identity
+    is carried exclusively by ``image_url`` — the PuLID-generated first frame.
+    """
+    logger.info(
+        "[IDENTITY] I2V identity carrier (image_url / first frame): %s",
+        (ctx.image_url[:80] + "...") if ctx.image_url and len(ctx.image_url) > 80 else ctx.image_url,
+    )
     if ctx.controlnet_video_url:
         payload["control_video_url"] = ctx.controlnet_video_url
         payload["reference_video_url"] = ctx.controlnet_video_url
@@ -106,6 +142,11 @@ def _apply_conditioning(payload: Dict[str, Any], ctx: I2VContext) -> Dict[str, A
     if ctx.num_inference_steps is not None and not ctx.draft_mode:
         steps = max(20, int(ctx.num_inference_steps))
         payload["num_inference_steps"] = steps
+    if ctx.full_body_reference_url and ctx.full_body_reference_url != ctx.image_url:
+        payload["reference_image_url"] = ctx.full_body_reference_url
+        payload["ip_adapter_image"] = ctx.full_body_reference_url
+        if ctx.face_reference_url:
+            payload["face_image"] = ctx.face_reference_url
     payload["enable_safety_checker"] = False
     return payload
 
@@ -287,6 +328,46 @@ async def ensure_public_media_url(
     uploaded_url = await fal_client.upload_file_async(str(local))
     logger.info("Uploaded local media to Fal CDN: %s", local.name)
     return uploaded_url
+
+
+async def _upload_motion_reference(local_path: str, api_key: Optional[str] = None) -> str:
+    """
+    Upload a local motion-reference MP4 to Fal CDN.
+
+    Requires fal_client and FAL_KEY when the path is not already a public URL.
+    """
+    from provider_adapters import V2V_MAX_VIDEO_BYTES
+
+    if _is_http_url(local_path):
+        return local_path
+
+    local = Path(local_path)
+    if not local.exists():
+        raise FileNotFoundError(f"Motion reference video not found: {local_path}")
+
+    size = local.stat().st_size
+    if size > V2V_MAX_VIDEO_BYTES:
+        raise ValueError(
+            f"Motion reference video exceeds {V2V_MAX_VIDEO_BYTES // (1024 * 1024)} MB limit "
+            f"({size} bytes): {local_path}"
+        )
+
+    suffix = local.suffix.lower()
+    if suffix not in (".mp4", ".mov", ".webm", ".avi", ".mkv"):
+        logger.warning(
+            "Motion reference has uncommon extension %s; upload may still succeed",
+            suffix or "(none)",
+        )
+
+    if not fal_client:
+        raise RuntimeError(
+            "fal_client not available for motion video upload. "
+            "Install with: pip install fal-client and set FAL_KEY."
+        )
+
+    url = await ensure_public_media_url(str(local), api_key)
+    logger.info("Motion reference uploaded to Fal CDN (%d bytes)", size)
+    return url
 
 
 async def _download_video_to_path(video_url: str, dest: Path) -> None:
@@ -492,16 +573,64 @@ I2V_ENDPOINTS: List[I2VEndpointSpec] = [
 ]
 
 
+def _v2v_build_payload(endpoint_id: str) -> Callable[[I2VContext], Dict[str, Any]]:
+    def _builder(ctx: I2VContext) -> Dict[str, Any]:
+        from provider_adapters import prepare_v2v_payload_fal
+
+        return prepare_v2v_payload_fal(ctx, endpoint_id)
+
+    return _builder
+
+
+def _build_v2v_endpoint_specs() -> List[I2VEndpointSpec]:
+    from provider_adapters import FAL_ENDPOINT_IDS, V2V_FAL_ENDPOINTS
+
+    specs: List[I2VEndpointSpec] = []
+    for spec_id in V2V_FAL_ENDPOINTS:
+        slug = FAL_ENDPOINT_IDS[spec_id]
+        specs.append(
+            I2VEndpointSpec(
+                id=spec_id,
+                endpoint=slug,
+                build_payload=_v2v_build_payload(spec_id),
+                parse_result=lambda r, c, sid=spec_id, ep=slug: _default_parse_result(
+                    r, c, sid, ep
+                ),
+                timeout=420 if "animate" in spec_id or spec_id == "wan-motion" else 360,
+            )
+        )
+    return specs
+
+
+_v2v_endpoints_cache: Optional[List[I2VEndpointSpec]] = None
+
+
+def _get_v2v_endpoints() -> List[I2VEndpointSpec]:
+    global _v2v_endpoints_cache
+    if _v2v_endpoints_cache is None:
+        _v2v_endpoints_cache = _build_v2v_endpoint_specs()
+    return _v2v_endpoints_cache
+
+
 class I2VFallbackRouter:
-    """Submit I2V jobs with ordered endpoint fallback."""
+    """Submit I2V/V2V jobs with ordered endpoint fallback."""
 
     def __init__(
         self,
         endpoints: Optional[List[I2VEndpointSpec]] = None,
         api_key: Optional[str] = None,
+        *,
+        mode: Literal["i2v", "v2v"] = "i2v",
     ):
-        self.endpoints = endpoints or I2V_ENDPOINTS
+        if endpoints is not None:
+            self.endpoints = endpoints
+        elif mode == "v2v":
+            self.endpoints = _get_v2v_endpoints()
+        else:
+            self.endpoints = I2V_ENDPOINTS
         self.api_key = api_key
+        self.mode = mode
+        self.last_obfuscation_applied = False
 
     def _ensure_client(self) -> None:
         if not fal_client:
@@ -518,6 +647,9 @@ class I2VFallbackRouter:
         timeout: int,
         ctx: I2VContext,
     ) -> Dict[str, Any]:
+        from provider_adapters import log_payload_debug
+
+        log_payload_debug(endpoint, payload)
         handler = await fal_client.submit_async(endpoint, arguments=payload)
         estimated = estimate_i2v_seconds(
             ctx.duration,
@@ -547,9 +679,11 @@ class I2VFallbackRouter:
         self._ensure_client()
         from prompt_obfuscation import obfuscate_prompt
 
+        mode_label = resolve_generation_mode(ctx)
         last_error: Optional[BaseException] = None
         timeout_scale = max(0.25, min(1.0, ctx.timeout_multiplier))
         obfuscation_applied = False
+        self.last_obfuscation_applied = False
 
         for i, spec in enumerate(self.endpoints):
             endpoints_to_try = (spec.endpoint,) + spec.endpoint_aliases
@@ -560,7 +694,8 @@ class I2VFallbackRouter:
                         payload = spec.build_payload(ctx)
                         effective_timeout = max(60, int(spec.timeout * timeout_scale))
                         logger.info(
-                            "Submitting I2V [%s] endpoint=%s duration=%.1fs preset=%s resolution=%s timeout=%ds",
+                            "Submitting %s [%s] endpoint=%s duration=%.1fs preset=%s resolution=%s timeout=%ds",
+                            mode_label.upper(),
                             spec.id,
                             endpoint,
                             ctx.duration,
@@ -575,7 +710,8 @@ class I2VFallbackRouter:
                         parsed.endpoint_id = endpoint
                         parsed.obfuscation_applied = obfuscation_applied
                         logger.info(
-                            "I2V success [%s] endpoint=%s video_url=%s",
+                            "%s success [%s] endpoint=%s video_url=%s",
+                            mode_label.upper(),
                             spec.id,
                             endpoint,
                             parsed.video_url[:80] + "..."
@@ -619,12 +755,177 @@ class I2VFallbackRouter:
                             break
                         raise
 
+        self.last_obfuscation_applied = obfuscation_applied
         raise RuntimeError(
-            f"All I2V endpoints failed. Last error: {last_error}"
+            f"All {mode_label.upper()} endpoints failed. Last error: {last_error}"
         ) from last_error
 
 
-async def generate_i2v_with_fallback(
+ForceProvider = Literal["fal", "replicate", "fal_then_replicate"]
+
+
+class MultiProviderFallbackRouter:
+    """
+    Fase 3.5 — Fal primary cascade, Replicate secondary fallback.
+
+    Attempt 1: Fal (Hunyuan → Wan → Kling → Luma) with obfuscation retry.
+    Attempt 2: Replicate when Fal is exhausted or policy remains after obfuscation.
+    """
+
+    def __init__(
+        self,
+        fal_api_key: Optional[str] = None,
+        replicate_token: Optional[str] = None,
+        fal_endpoints: Optional[List[I2VEndpointSpec]] = None,
+        *,
+        mode: Literal["i2v", "v2v"] = "i2v",
+    ):
+        self.fal_api_key = fal_api_key
+        self.replicate_token = replicate_token
+        self.mode = mode
+        self.fal_router = I2VFallbackRouter(
+            endpoints=fal_endpoints,
+            api_key=fal_api_key,
+            mode=mode,
+        )
+
+    @staticmethod
+    def _force_replicate_active(force_provider: Optional[str]) -> bool:
+        env_force = os.getenv("FORCE_REPLICATE", "").strip().lower()
+        if env_force in ("1", "true", "yes"):
+            return True
+        return (force_provider or "").strip().lower() == "replicate"
+
+    async def _generate_replicate(
+        self,
+        ctx: I2VContext,
+        *,
+        obfuscation_applied: bool = False,
+    ) -> I2VResult:
+        from replicate_i2v_provider import ReplicateI2VProvider
+
+        provider = ReplicateI2VProvider(api_token=self.replicate_token)
+        return await provider.generate(
+            ctx,
+            fal_api_key=self.fal_api_key,
+            obfuscation_applied=obfuscation_applied,
+        )
+
+    async def generate(
+        self,
+        ctx: I2VContext,
+        *,
+        force_provider: Optional[ForceProvider] = None,
+    ) -> I2VResult:
+        mode = resolve_generation_mode(ctx)
+        if self.mode != mode:
+            self.mode = mode
+            self.fal_router = I2VFallbackRouter(
+                api_key=self.fal_api_key,
+                mode=mode,
+            )
+
+        force = (force_provider or os.getenv("I2V_FORCE_PROVIDER", "")).strip().lower()
+
+        if self._force_replicate_active(force):
+            logger.info(
+                "[INFO] FORCE_REPLICATE active — skipping Fal, using Replicate provider"
+            )
+            return await self._generate_replicate(ctx)
+
+        if force == "fal":
+            try:
+                return await self.fal_router.generate(ctx)
+            except Exception as fal_only_exc:
+                if mode == "v2v":
+                    logger.warning(
+                        "[WARN] V2V Fal endpoints exhausted (%s). "
+                        "Falling back to I2V with warning.",
+                        fal_only_exc,
+                    )
+                    i2v_ctx = _ctx_without_motion_reference(ctx)
+                    i2v_router = I2VFallbackRouter(
+                        api_key=self.fal_api_key,
+                        mode="i2v",
+                    )
+                    return await i2v_router.generate(i2v_ctx)
+                raise
+
+        fal_error: Optional[BaseException] = None
+        obfuscation_applied = False
+        try:
+            return await self.fal_router.generate(ctx)
+        except Exception as exc:
+            fal_error = exc
+            obfuscation_applied = self.fal_router.last_obfuscation_applied
+
+        if mode == "v2v":
+            logger.warning(
+                "[WARN] V2V Fal cascade failed (%s). Attempting Replicate V2V, "
+                "then I2V fallback.",
+                fal_error,
+            )
+
+        logger.info("[INFO] Fal exhausted, switching to Replicate provider")
+        try:
+            result = await self._generate_replicate(
+                ctx, obfuscation_applied=obfuscation_applied
+            )
+            if fal_error:
+                logger.info(
+                    "Replicate fallback succeeded after Fal failure: %s",
+                    type(fal_error).__name__,
+                )
+            return result
+        except Exception as replicate_exc:
+            if mode == "v2v":
+                logger.warning(
+                    "[WARN] Replicate V2V failed (%s). Final fallback to I2V.",
+                    replicate_exc,
+                )
+                i2v_ctx = _ctx_without_motion_reference(ctx)
+                i2v_router = I2VFallbackRouter(
+                    api_key=self.fal_api_key,
+                    mode="i2v",
+                )
+                return await i2v_router.generate(i2v_ctx)
+            raise RuntimeError(
+                f"Fal and Replicate I2V both failed. "
+                f"Fal: {fal_error}; Replicate: {replicate_exc}"
+            ) from replicate_exc
+
+
+def _ctx_without_motion_reference(ctx: I2VContext) -> I2VContext:
+    """Strip motion reference fields for I2V fallback after V2V exhaustion."""
+    return I2VContext(
+        image_url=ctx.image_url,
+        prompt=ctx.prompt,
+        duration=ctx.duration,
+        fps=ctx.fps,
+        negative_prompt=ctx.negative_prompt,
+        motion_preset=ctx.motion_preset,
+        resolution=ctx.resolution,
+        timeout_multiplier=ctx.timeout_multiplier,
+        draft_mode=ctx.draft_mode,
+        stage_label=ctx.stage_label,
+        segment_index=ctx.segment_index,
+        segment_total=ctx.segment_total,
+        on_progress=ctx.on_progress,
+        identity_vector=ctx.identity_vector,
+        identity_adapter_strength=ctx.identity_adapter_strength,
+        reference_image_url=ctx.reference_image_url,
+        face_reference_url=ctx.face_reference_url,
+        full_body_reference_url=ctx.full_body_reference_url,
+        ip_adapter_image=ctx.ip_adapter_image,
+        controlnet_video_url=ctx.controlnet_video_url,
+        pose_map_url=ctx.pose_map_url,
+        num_inference_steps=ctx.num_inference_steps,
+        canvas_expanded=ctx.canvas_expanded,
+        canvas_padding=ctx.canvas_padding,
+    )
+
+
+async def generate_video_with_fallback(
     image_url: str,
     prompt: str,
     duration: float,
@@ -644,43 +945,77 @@ async def generate_i2v_with_fallback(
     on_progress: Optional[ProgressCallback] = None,
     identity_vector: Optional[np.ndarray] = None,
     identity_adapter_strength: float = 0.95,
+    reference_image_url: Optional[str] = None,
+    face_reference_url: Optional[str] = None,
+    full_body_reference_url: Optional[str] = None,
+    ip_adapter_image: Optional[str] = None,
     controlnet_video_url: Optional[str] = None,
     pose_map_url: Optional[str] = None,
     num_inference_steps: Optional[int] = None,
+    motion_reference_video_path: Optional[str] = None,
+    motion_reference_video_url: Optional[str] = None,
+    canvas_expanded: bool = False,
+    canvas_padding: Optional[Dict[str, float]] = None,
+    replicate_token: Optional[str] = None,
+    force_provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Convenience wrapper returning dict compatible with core_engine._generate_single_video.
 
+    Auto-selects V2V when motion_reference_video_path/url is set, otherwise I2V.
+
     provider:
-        - "fal" (default): Fal I2V endpoints only
-        - "replicate": Replicate I2V only (bypasses Fal content filters)
-        - "fal_then_replicate": Fal first, Replicate on policy/404 failures
+        - "fal": Fal endpoints only
+        - "replicate": Replicate only (bypasses Fal content filters)
+        - "fal_then_replicate" (default): Fal first, Replicate on exhaustion/policy
+
+    force_provider:
+        - "replicate": skip Fal (same as FORCE_REPLICATE=1 env var)
     """
-    provider_norm = (provider or "fal").strip().lower()
+    provider_norm = (provider or "fal_then_replicate").strip().lower()
+    replicate_token = replicate_token or os.getenv("REPLICATE_API_TOKEN")
 
-    if provider_norm == "replicate":
-        from replicate_i2v_provider import generate_i2v_replicate
+    if provider_norm == "replicate" or (
+        force_provider or os.getenv("FORCE_REPLICATE", "")
+    ).strip().lower() in ("1", "true", "replicate"):
+        force: ForceProvider = "replicate"
+    elif provider_norm == "fal":
+        force = "fal"
+    else:
+        force = "fal_then_replicate"
 
-        result = await generate_i2v_replicate(
-            image_url=image_url,
-            prompt=prompt,
-            duration=duration,
-            negative_prompt=negative_prompt,
-            resolution=resolution,
-            timeout_multiplier=timeout_multiplier,
-        )
-        if require_last_frame and result.get("video_url"):
-            last_frame_url = await ensure_last_frame_url(
-                result["video_url"], result.get("last_frame_url"), api_key
+    public_image_url = image_url
+    if not image_url.startswith(("http://", "https://")):
+        if api_key:
+            public_image_url = await ensure_public_image_url(image_url, api_key)
+        elif force == "fal":
+            raise ValueError(
+                "Local image path requires FAL_KEY for CDN upload when using Fal provider"
             )
-        else:
-            last_frame_url = result.get("last_frame_url")
-        result["last_frame_url"] = last_frame_url
-        return result
 
-    image_url = await ensure_public_image_url(image_url, api_key)
+    motion_path = motion_reference_video_path
+    motion_url = motion_reference_video_url
+    if motion_path or motion_url:
+        try:
+            if motion_path and not motion_url:
+                if not api_key:
+                    raise ValueError(
+                        "V2V mode requires FAL_KEY to upload local motion reference video"
+                    )
+                motion_url = await _upload_motion_reference(motion_path, api_key)
+            elif motion_url and not _is_http_url(motion_url):
+                if not api_key:
+                    raise ValueError(
+                        "V2V mode requires FAL_KEY to upload local motion reference video"
+                    )
+                motion_url = await _upload_motion_reference(motion_url, api_key)
+        except Exception as upload_exc:
+            raise RuntimeError(
+                f"V2V mode selected but motion reference video upload failed: {upload_exc}"
+            ) from upload_exc
+
     ctx = I2VContext(
-        image_url=image_url,
+        image_url=public_image_url,
         prompt=prompt,
         duration=duration,
         fps=fps,
@@ -695,59 +1030,52 @@ async def generate_i2v_with_fallback(
         on_progress=on_progress,
         identity_vector=identity_vector,
         identity_adapter_strength=identity_adapter_strength,
+        reference_image_url=reference_image_url or full_body_reference_url,
+        face_reference_url=face_reference_url,
+        full_body_reference_url=full_body_reference_url,
+        ip_adapter_image=ip_adapter_image or full_body_reference_url or reference_image_url,
         controlnet_video_url=controlnet_video_url,
         pose_map_url=pose_map_url,
         num_inference_steps=num_inference_steps,
+        motion_reference_video_path=motion_path,
+        motion_reference_video_url=motion_url,
+        canvas_expanded=canvas_expanded,
+        canvas_padding=canvas_padding,
+    )
+    logger.info(
+        "[IDENTITY] First frame URL for I2V: %s",
+        public_image_url[:80] + "..." if len(public_image_url) > 80 else public_image_url,
     )
 
-    fal_error: Optional[BaseException] = None
-    if provider_norm in ("fal", "fal_then_replicate"):
-        router = I2VFallbackRouter(api_key=api_key)
-        try:
-            result = await router.generate(ctx)
-            if require_last_frame:
-                last_frame_url = await ensure_last_frame_url(
-                    result.video_url, result.last_frame_url, api_key
-                )
-            else:
-                last_frame_url = result.last_frame_url
-            return {
-                "video_url": result.video_url,
-                "duration": result.duration,
-                "last_frame_url": last_frame_url,
-                "endpoint_id": result.endpoint_id,
-                "provider_id": result.provider_id,
-                "obfuscation_applied": result.obfuscation_applied,
-                "num_segments": 1,
-                "mean_drift": 0.0,
-                "temporal_consistency": 1.0,
-            }
-        except Exception as exc:
-            fal_error = exc
-            if provider_norm != "fal_then_replicate":
-                raise
-            logger.warning(
-                "Fal I2V fallito (%s), fallback su Replicate...",
-                exc,
-            )
-
-    from replicate_i2v_provider import generate_i2v_replicate
-
-    result = await generate_i2v_replicate(
-        image_url=image_url,
-        prompt=prompt,
-        duration=duration,
-        negative_prompt=negative_prompt,
-        resolution=resolution,
-        timeout_multiplier=timeout_multiplier,
+    mode = resolve_generation_mode(ctx)
+    router = MultiProviderFallbackRouter(
+        fal_api_key=api_key,
+        replicate_token=replicate_token,
+        mode=mode,
     )
-    if require_last_frame and result.get("video_url"):
+    result = await router.generate(ctx, force_provider=force)
+
+    if require_last_frame:
         last_frame_url = await ensure_last_frame_url(
-            result["video_url"], result.get("last_frame_url"), api_key
+            result.video_url, result.last_frame_url, api_key
         )
     else:
-        last_frame_url = result.get("last_frame_url")
-    result["last_frame_url"] = last_frame_url
-    if fal_error:
-        logger.info("Replicate fallback riuscito dopo errore Fal: %s", fal_error)
-    return result
+        last_frame_url = result.last_frame_url
+
+    return {
+        "video_url": result.video_url,
+        "duration": result.duration,
+        "last_frame_url": last_frame_url,
+        "endpoint_id": result.endpoint_id,
+        "provider_id": result.provider_id,
+        "obfuscation_applied": result.obfuscation_applied,
+        "generation_mode": mode,
+        "num_segments": 1,
+        "mean_drift": 0.0,
+        "temporal_consistency": 1.0,
+    }
+
+
+async def generate_i2v_with_fallback(*args, **kwargs) -> Dict[str, Any]:
+    """Backward-compatible alias for generate_video_with_fallback."""
+    return await generate_video_with_fallback(*args, **kwargs)

@@ -115,7 +115,12 @@ class KinematicRetriever:
         logger.info(f"  Target FPS: {self.config.target_fps}")
         
         # Verify dependencies
+        self._ffmpeg_available = self._ffmpeg_binary_available()
         self._verify_dependencies()
+    
+    def _ffmpeg_binary_available(self) -> bool:
+        """Check whether the FFmpeg CLI is on PATH."""
+        return shutil.which("ffmpeg") is not None
     
     def _verify_dependencies(self) -> None:
         """Verify that required dependencies are installed."""
@@ -123,20 +128,18 @@ class KinematicRetriever:
             raise RuntimeError("yt-dlp not installed. Install with: pip install yt-dlp")
         
         if ffmpeg is None:
-            raise RuntimeError("ffmpeg-python not installed. Install with: pip install ffmpeg-python")
-        
-        # Check if FFmpeg binary is available
-        try:
-            subprocess.run(
-                ["ffmpeg", "-version"],
-                capture_output=True,
-                check=True,
-                timeout=5
+            logger.warning(
+                "ffmpeg-python not installed. Trim/normalize disabled. "
+                "Install with: pip install ffmpeg-python"
             )
+        
+        if self._ffmpeg_available:
             logger.info("✓ FFmpeg binary found")
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-            logger.warning("FFmpeg binary not found in PATH. Install FFmpeg from https://ffmpeg.org/")
-            logger.warning("Video processing will fail without FFmpeg binary.")
+        else:
+            logger.warning("[WARNING CRITICO] FFmpeg non trovato nel PATH")
+            logger.warning(
+                "Trim/normalize verrà saltato; yt-dlp scaricherà il file integrale con avviso."
+            )
     
     def _sanitize_filename(self, query: str) -> str:
         """
@@ -205,7 +208,11 @@ class KinematicRetriever:
         except Exception as e:
             logger.warning(f"Could not check disk space: {e}")
     
-    async def _download_video(self, query: str) -> Tuple[Path, dict]:
+    async def _download_video(
+        self,
+        query: str,
+        max_duration: Optional[int] = None,
+    ) -> Tuple[Path, dict]:
         """
         Download video from YouTube using yt-dlp.
         
@@ -243,6 +250,21 @@ class KinematicRetriever:
             'noplaylist': True,
             'playlistend': 1,
         }
+
+        duration_limit = max_duration or self.config.trim_duration
+        use_duration_filter = False
+        if not self._ffmpeg_available and duration_limit:
+            try:
+                ydl_opts['match_filter'] = yt_dlp.utils.match_filter_func(
+                    f"duration <= {duration_limit + 15}"
+                )
+                use_duration_filter = True
+                logger.info(
+                    "FFmpeg assente: filtro yt-dlp duration <= %ss",
+                    duration_limit + 15,
+                )
+            except Exception as exc:
+                logger.warning("Impossibile applicare match_filter yt-dlp: %s", exc)
         
         try:
             # Execute download with retry logic
@@ -264,7 +286,19 @@ class KinematicRetriever:
                             video_info = info
                         
                         # Find downloaded file
-                        downloaded_files = list(self.temp_dir.glob(f"{temp_filename}.*"))
+                        downloaded_files = [
+                            p for p in self.temp_dir.glob(f"{temp_filename}.*")
+                            if p.is_file() and not p.name.endswith(".part")
+                        ]
+                        if not downloaded_files and use_duration_filter:
+                            logger.warning(
+                                "Nessun video passa il filtro durata — "
+                                "retry senza match_filter (file integrale)"
+                            )
+                            ydl_opts.pop("match_filter", None)
+                            use_duration_filter = False
+                            continue
+
                         if not downloaded_files:
                             raise DownloadError("Downloaded file not found")
                         
@@ -386,6 +420,41 @@ class KinematicRetriever:
             logger.error(f"Video processing failed: {e}")
             raise ProcessingError(f"Failed to process video: {e}")
     
+    async def _use_whole_file_fallback(
+        self,
+        input_path: Path,
+        output_path: Path,
+        duration: int,
+    ) -> None:
+        """
+        Fallback when FFmpeg is unavailable: cache the downloaded file as-is.
+        
+        Avoids WinError 2 from missing ffmpeg binary.
+        """
+        logger.warning("[WARNING CRITICO] FFmpeg non trovato nel PATH")
+        logger.warning(
+            "Skip trim/normalize — uso file integrale (%s). "
+            "Durata target %ss non garantita.",
+            input_path.name,
+            duration,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if input_path.resolve() == output_path.resolve():
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                raise ProcessingError("Input file missing or empty")
+            return
+
+        shutil.copy2(input_path, output_path)
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise ProcessingError("Fallback copy produced empty output")
+
+        logger.info(
+            "✓ File integrale salvato in cache: %.2f MB",
+            output_path.stat().st_size / 1024 / 1024,
+        )
+    
     def _cleanup_temp_files(self, *paths: Path) -> None:
         """
         Clean up temporary files.
@@ -445,18 +514,25 @@ class KinematicRetriever:
             self._check_disk_space()
             
             # STEP 3: Download video
-            downloaded_path, metadata = await self._download_video(query)
+            downloaded_path, metadata = await self._download_video(query, max_duration=duration)
             
             # STEP 4: Prepare output path
             filename = self._sanitize_filename(query)
             output_path = self.cache_dir / f"{filename}.mp4"
             
-            # STEP 5: Trim and normalize with FFmpeg
-            await self._trim_and_normalize(
-                input_path=downloaded_path,
-                output_path=output_path,
-                duration=duration
-            )
+            # STEP 5: Trim and normalize with FFmpeg (or fallback without trim)
+            if self._ffmpeg_available and ffmpeg is not None:
+                await self._trim_and_normalize(
+                    input_path=downloaded_path,
+                    output_path=output_path,
+                    duration=duration
+                )
+            else:
+                await self._use_whole_file_fallback(
+                    input_path=downloaded_path,
+                    output_path=output_path,
+                    duration=duration,
+                )
             
             # STEP 6: Cleanup temporary files
             self._cleanup_temp_files(downloaded_path)

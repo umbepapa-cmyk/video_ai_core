@@ -426,6 +426,15 @@ class AnimateDiffEngine:
                 controlnet_video_url=payload.get("controlnet_video_url"),
                 pose_map_url=payload.get("pose_map_url"),
                 num_inference_steps=payload.get("num_inference_steps"),
+                motion_reference_video_path=payload.get("motion_reference_video_path"),
+                provider=payload.get("i2v_provider")
+                or payload.get("provider", "fal_then_replicate"),
+                force_provider=payload.get("force_provider"),
+                replicate_token=payload.get("replicate_token"),
+                reference_image_url=payload.get("reference_image_url"),
+                face_reference_url=payload.get("face_reference_url"),
+                full_body_reference_url=payload.get("full_body_reference_url"),
+                ip_adapter_image=payload.get("ip_adapter_image"),
             )
 
             generation_time = time.time() - start_time
