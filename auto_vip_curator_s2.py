@@ -34,7 +34,8 @@ TRIGGER_WORD = "soggetto_due_vip"
 VIP_EXPORT_STEM_PREFIX = "vip_s2_"
 GENDER_JSON_NAME = "gender.json"
 
-VIP_TARGET_MIN = 20
+VIP_TARGET_MIN = 15
+VIP_FALLBACK_MIN = 15
 VIP_TARGET_MAX = 25
 SHARPNESS_THRESHOLD = 80.0
 
@@ -55,6 +56,7 @@ class VIPCurationStats:
     relaxed: bool = False
     rejection_reasons: dict[str, int] = field(default_factory=dict)
     exported_files: list[str] = field(default_factory=list)
+    fallback_face_front: int = 0
     moved_files: list[str] = field(default_factory=list)
     kept_files: list[str] = field(default_factory=list)
 
@@ -75,13 +77,14 @@ def _evaluate_vip(
     source_path: Path,
     image_path: Optional[Path],
     sharpness_threshold: float,
+    strict: bool = True,
 ) -> tuple[Optional[Candidate], str]:
     candidate, reason = curator.evaluate(
         image,
         source_label,
         source_path,
         image_path=image_path,
-        strict=True,
+        strict=strict,
     )
     if candidate is None:
         key = "blur" if "sfocat" in reason.lower() else "no_face"
@@ -95,7 +98,7 @@ def _evaluate_vip(
     if _face_crop_sharpness(curator, image, bbox) < sharpness_threshold:
         return None, "blur"
 
-    ok, metrics = curator.check_face_size_and_occlusion(image, strict=True)
+    ok, metrics = curator.check_face_size_and_occlusion(image, strict=strict)
     if not ok or metrics is None:
         return None, "occlusion"
 
@@ -131,12 +134,15 @@ def _collect_candidates(
     recursive: bool,
     sharpness_threshold: float,
     stats: VIPCurationStats,
+    strict: bool = True,
 ) -> list[Candidate]:
     accepted: list[Candidate] = []
     video_ext = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
     for media_path in _iter_media_files(input_dir, recursive):
         if media_path.suffix.lower() in video_ext:
-            for frame, label in _sample_video_frames(media_path):
+            for frame, label in _sample_video_frames(
+                media_path, min_sharpness=sharpness_threshold
+            ):
                 cand, reason = _evaluate_vip(
                     curator,
                     frame,
@@ -144,6 +150,8 @@ def _collect_candidates(
                     source_path=media_path,
                     image_path=None,
                     sharpness_threshold=sharpness_threshold,
+                
+                    strict=strict,
                 )
                 if cand is None:
                     stats.rejected_total += 1
@@ -164,6 +172,8 @@ def _collect_candidates(
             source_path=media_path,
             image_path=media_path,
             sharpness_threshold=sharpness_threshold,
+        
+            strict=strict,
         )
         if cand is None:
             stats.rejected_total += 1
@@ -172,6 +182,57 @@ def _collect_candidates(
             stats.accepted_total += 1
             accepted.append(cand)
     return accepted
+
+
+
+
+def _face_front_tier_dir(subject_num: int) -> Path:
+    return PROJECT_ROOT / "datasets" / f"soggetto{subject_num}_v3" / "face_front"
+
+
+def _seed_vip_from_face_front_tier(
+    *,
+    subject_num: int,
+    output_dir: Path,
+    trigger_word: str,
+    subject_gender: str,
+    stem_prefix: str,
+    need: int,
+    max_total: int,
+) -> list[Path]:
+    """Copy tier-A face_front exports into VIP dataset when biometric curation is sparse."""
+    tier_dir = _face_front_tier_dir(subject_num)
+    if not tier_dir.is_dir():
+        logger.warning("VIP fallback: missing %s", tier_dir)
+        return []
+    images = sorted(tier_dir.glob("lora_train_*.jpg"))
+    if not images:
+        logger.warning("VIP fallback: no lora_train_*.jpg in %s", tier_dir)
+        return []
+    caption = build_vip_face_caption(trigger_word, subject_gender)  # type: ignore[arg-type]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    existing = len(list(output_dir.glob(f"{stem_prefix}*.jpg")))
+    exported: list[Path] = []
+    for src in images:
+        if existing + len(exported) >= max_total:
+            break
+        if len(exported) >= need:
+            break
+        idx = existing + len(exported) + 1
+        stem = f"{stem_prefix}{idx:03d}"
+        out_img = output_dir / f"{stem}.jpg"
+        out_txt = output_dir / f"{stem}.txt"
+        shutil.copy2(src, out_img)
+        out_txt.write_text(caption + "\n", encoding="utf-8")
+        exported.append(out_img)
+    if exported:
+        logger.info(
+            "VIP fallback: seeded %d images from %s (subject %d)",
+            len(exported),
+            tier_dir.name,
+            subject_num,
+        )
+    return exported
 
 
 def _export_vip_images(
@@ -191,7 +252,11 @@ def _export_vip_images(
         stem = f"{stem_prefix}{index:03d}"
         out_img = output_dir / f"{stem}.jpg"
         out_txt = output_dir / f"{stem}.txt"
-        crop = cand.face_crop or cand.processed_image or cand.image
+        crop = cand.face_crop
+        if crop is None:
+            crop = cand.processed_image
+        if crop is None:
+            crop = cand.image
         cv2.imwrite(str(out_img), crop)
         out_txt.write_text(caption + "\n", encoding="utf-8")
         exported.append(out_img)
@@ -288,9 +353,53 @@ def run_vip_curation(
                 stats=stats,
             )
             selected = _select_vip_diverse(accepted, max_count=max_export)
+        if not accepted:
+            logger.warning("Strict VIP found no candidates; retrying with relaxed biometrics")
+            stats.relaxed = True
+            stats.accepted_total = 0
+            stats.rejected_total = 0
+            stats.rejection_reasons = {}
+            accepted = _collect_candidates(
+                curator,
+                input_dir=input_dir,
+                recursive=recursive,
+                sharpness_threshold=max(45.0, sharpness_threshold * 0.6),
+                stats=stats,
+                strict=False,
+            )
+            selected = _select_vip_diverse(accepted, max_count=max_export)
+
+    if (
+        not dry_run
+        and len(selected) < VIP_FALLBACK_MIN
+    ):
+        need = max(1, VIP_FALLBACK_MIN - len(selected))
+        if selected:
+            pre = _export_vip_images(
+                selected,
+                output_dir=output_dir,
+                trigger_word=trigger_word,
+                subject_gender=subject_gender,
+                stem_prefix=stem_prefix,
+            )
+            stats.exported = len(pre)
+            stats.exported_files = [x.name for x in pre]
+        seeded = _seed_vip_from_face_front_tier(
+            subject_num=SUBJECT_NUM,
+            output_dir=output_dir,
+            trigger_word=trigger_word,
+            subject_gender=subject_gender,
+            stem_prefix=stem_prefix,
+            need=need,
+            max_total=max_export,
+        )
+        if seeded:
+            stats.fallback_face_front = len(seeded)
+            stats.exported = len(list(output_dir.glob(f"{stem_prefix}*.jpg")))
+            stats.exported_files = [x.name for x in sorted(output_dir.glob(f"{stem_prefix}*.jpg"))]
 
     exported_paths: list[Path] = []
-    if not dry_run and selected:
+    if not dry_run and selected and stats.exported <= 0:
         exported_paths = _export_vip_images(
             selected,
             output_dir=output_dir,
@@ -303,7 +412,7 @@ def run_vip_curation(
 
     exported_sources = {str(c.source_path.resolve()) for c in selected}
     reject_root = copy_rejects_to or (scarti_dir if move_rejects else None)
-    if not dry_run and reject_root is not None:
+    if not dry_run and reject_root is not None and selected:
         for media_path in _iter_media_files(input_dir, recursive):
             key = str(media_path.resolve())
             if key in exported_sources:
@@ -344,8 +453,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         sharpness_threshold=args.sharpness_threshold,
         max_export=max(1, args.max_export),
     )
-    if stats.exported <= 0 and not args.dry_run:
-        logger.error("No VIP images exported")
+    if stats.exported < 5 and not args.dry_run:
+        logger.error("No VIP images exported (need >=5)")
         return 1
     return 0
 
