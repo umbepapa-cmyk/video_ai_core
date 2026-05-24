@@ -12,7 +12,7 @@ INPUTS_ROOT = PROJECT_ROOT / "inputs"
 OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
 MODELS_DIR = PROJECT_ROOT / "models"
 
-ACTIVE_SUBJECTS: tuple[int, ...] = (1, 2, 4, 5)
+ACTIVE_SUBJECTS: tuple[int, ...] = (1, 2, 3, 4, 5)
 
 VIP_TRIGGER_BY_SUBJECT: dict[int, str] = {
     1: "soggetto_uno_vip",

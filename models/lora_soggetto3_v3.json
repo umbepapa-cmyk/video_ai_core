@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-05-24T18:37:58.315165+00:00",
+  "trigger_word": "soggetto_tre",
+  "destination": "umbepapa-collab/flux-lora-soggetto3",
+  "training_id": "g8c7rjfx7hrmt0cybcx846ndj4",
+  "status": "succeeded",
+  "steps": 1200,
+  "dataset_folder": "C:\\Users\\umbep\\OneDrive\\Desktop\\uncensored_video_app\\AppVideoAI\\datasets\\soggetto3_v3",
+  "weights_url": "https://replicate.delivery/xezq/ceEC1OZm55S3NCDBAj33YYk26JAyGE01FPERx4l5shH1uHULA/trained_model.tar",
+  "replicate_weights": "umbepapa-collab/flux-lora-soggetto3:26dce37af90b9d997eeb970d92e47de3064d46c300504ae376c75bef6a9022d2",
+  "trainer": "ostris/flux-dev-lora-trainer",
+  "trainer_version": "26dce37af90b9d997eeb970d92e47de3064d46c300504ae376c75bef6a9022d2",
+  "output": {
+    "version": "umbepapa-collab/flux-lora-soggetto3:58b81895f3006deedd4ecf4d8ae175d9ad8bdc934ed6be8e6c96c588b5bc8b78",
+    "weights": "https://replicate.delivery/xezq/ceEC1OZm55S3NCDBAj33YYk26JAyGE01FPERx4l5shH1uHULA/trained_model.tar"
+  },
+  "completed_at": "2026-05-24T18:37:40.276114137Z",
+  "urls": {
+    "cancel": "https://api.replicate.com/v1/predictions/g8c7rjfx7hrmt0cybcx846ndj4/cancel",
+    "get": "https://api.replicate.com/v1/predictions/g8c7rjfx7hrmt0cybcx846ndj4",
+    "stream": "https://stream.replicate.com/v1/files/jbxs-yuo7sdaw7aireups4nc5jn72wropcy2a3w3iqfya6ra4yxegkkzq",
+    "web": "https://replicate.com/p/g8c7rjfx7hrmt0cybcx846ndj4"
+  },
+  "lora_rank": 32,
+  "dataset_mode": "combined"
+}

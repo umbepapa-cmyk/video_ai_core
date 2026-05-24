@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-05-24T18:22:06.723786+00:00",
+  "trigger_word": "soggetto_tre_vip",
+  "destination": "umbepapa-collab/flux-lora-soggetto3",
+  "training_id": "c9dtmp114srmy0cybcpvt56x60",
+  "status": "succeeded",
+  "steps": 1200,
+  "dataset_folder": "C:\\Users\\umbep\\OneDrive\\Desktop\\uncensored_video_app\\AppVideoAI\\inputs\\VIP_Dataset_Soggetto3",
+  "weights_url": "https://replicate.delivery/xezq/K1K7rfpjLn28QKlpN5QpOlVpxCKMzIgGGeZ9ifme7CMC68gaB/trained_model.tar",
+  "replicate_weights": "umbepapa-collab/flux-lora-soggetto3:26dce37af90b9d997eeb970d92e47de3064d46c300504ae376c75bef6a9022d2",
+  "trainer": "ostris/flux-dev-lora-trainer",
+  "trainer_version": "26dce37af90b9d997eeb970d92e47de3064d46c300504ae376c75bef6a9022d2",
+  "output": {
+    "version": "umbepapa-collab/flux-lora-soggetto3:8c4e84835b374aef90f316b95658207378726b37ed7a2a20bf102e28a669c50c",
+    "weights": "https://replicate.delivery/xezq/K1K7rfpjLn28QKlpN5QpOlVpxCKMzIgGGeZ9ifme7CMC68gaB/trained_model.tar"
+  },
+  "completed_at": "2026-05-24T18:21:28.202075986Z",
+  "urls": {
+    "cancel": "https://api.replicate.com/v1/predictions/c9dtmp114srmy0cybcpvt56x60/cancel",
+    "get": "https://api.replicate.com/v1/predictions/c9dtmp114srmy0cybcpvt56x60",
+    "stream": "https://stream.replicate.com/v1/files/jbxs-ggpi7d5exu2d27g74vivcepfrlto5hvfnxt6oxas76fys5nt7aka",
+    "web": "https://replicate.com/p/c9dtmp114srmy0cybcpvt56x60"
+  },
+  "requested_destination": "umbepapa-collab/flux-lora-soggetto3-vip",
+  "lora_rank": null,
+  "autocaption": false,
+  "vip": true,
+  "subject_gender": "female",
+  "legacy_backup": "lora_soggetto2_legacy.json"
+}
