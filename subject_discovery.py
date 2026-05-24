@@ -81,8 +81,14 @@ def discover_subject_inputs(inputs_root: Path) -> dict[int, Path]:
         num = int(match.group(1))
         found.setdefault(num, []).append(path)
 
+    def _media_count(folder: Path) -> int:
+        if not folder.is_dir():
+            return 0
+        exts = {".jpg", ".jpeg", ".png", ".webp", ".JPG", ".JPEG", ".PNG"}
+        return sum(1 for f in folder.rglob("*") if f.is_file() and f.suffix in exts)
+
     return {
-        num: sorted(paths, key=lambda p: (len(p.name), p.name))[0]
+        num: sorted(paths, key=lambda p: (-_media_count(p), len(p.name), p.name))[0]
         for num, paths in found.items()
     }
 
