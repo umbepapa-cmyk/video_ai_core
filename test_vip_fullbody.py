@@ -78,7 +78,7 @@ def _build_fal_payload(lora_path: str, prompt: str, negative_prompt: str) -> Dic
     return {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
-        "image_size": "portrait_9_16",
+        "image_size": "portrait_16_9",
         "num_inference_steps": FLUX_STEPS,
         "guidance_scale": FLUX_GUIDANCE,
         "num_images": 1,
