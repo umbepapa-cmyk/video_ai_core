@@ -10,15 +10,19 @@ This module implements:
 - Anatomical integrity preservation through negative prompts
 """
 
+import json
 import os
 import logging
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from dotenv import load_dotenv
 from path_config import CARTELLA_CHECKPOINT_PERSONALIZZATI_PATH
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+MODELS_DIR = PROJECT_ROOT / "models"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -182,6 +186,198 @@ class NegativePromptMatrix:
             include_facial=True,
             custom_negatives=custom_negatives
         )
+
+
+@dataclass
+class LoRAConfig:
+    """Native subject LoRA configuration for Fal.ai Flux stacking."""
+    subject_id: str
+    lora_path_or_id: str = ""
+    trigger_word: str = ""
+    weight: float = 0.95
+    metadata_path: Optional[str] = None
+    training_status: str = "missing"
+    destination: str = ""
+    subject_gender: Optional[str] = None
+
+    @property
+    def is_ready(self) -> bool:
+        status = str(self.training_status).lower()
+        return bool(self.lora_path_or_id) and status == "succeeded"
+
+
+class LoRAManager:
+    """
+    Registry of per-subject native LoRAs (soggetto_1 .. soggetto_6).
+
+    Syncs weights from models/lora_soggetto{N}.json training outputs.
+    """
+
+    _EXPECTED_TRIGGERS: Dict[str, str] = {
+        "soggetto_1": "soggetto_uno",
+        "soggetto_2": "soggetto_due",
+        "soggetto_3": "soggetto_tre",
+        "soggetto_4": "soggetto_quattro",
+        "soggetto_5": "soggetto_cinque",
+        "soggetto_6": "soggetto_sei",
+    }
+
+    _EXPECTED_DESTINATIONS: Dict[str, str] = {
+        "soggetto_1": "umbepapa-collab/flux-lora-soggetto1",
+        "soggetto_2": "umbepapa-collab/flux-lora-soggetto2",
+        "soggetto_3": "umbepapa-collab/flux-lora-soggetto3",
+        "soggetto_4": "umbepapa-collab/flux-lora-soggetto4",
+        "soggetto_5": "umbepapa-collab/flux-lora-soggetto5",
+        "soggetto_6": "umbepapa-collab/flux-lora-soggetto6",
+    }
+
+    def __init__(self, *, version: Optional[str] = None) -> None:
+        self._version = version
+        self._registry: Dict[str, LoRAConfig] = {
+            "soggetto_1": LoRAConfig(subject_id="soggetto_1", lora_path_or_id="umbepapa-collab/flux-lora-soggetto1:eda2067c02180f81bb521febe68e08e3e28e288cb6544701c63a71f132c337e8", trigger_word="soggetto_uno", weight=0.95),
+            "soggetto_2": LoRAConfig(subject_id="soggetto_2", lora_path_or_id="umbepapa-collab/flux-lora-soggetto2:8cc065fc698689d5eb3a93f3402b192d6bdfdc01e352df91023237163f07b9bd", trigger_word="soggetto_due", weight=0.95),
+            "soggetto_3": LoRAConfig(subject_id="soggetto_3", lora_path_or_id="umbepapa-collab/flux-lora-soggetto3:57390ef383e46b64aa561e1612642a25a2ad99385b8cb065820e6803f4d7aa32", trigger_word="soggetto_tre", weight=0.95),
+            "soggetto_4": LoRAConfig(subject_id="soggetto_4", lora_path_or_id="umbepapa-collab/flux-lora-soggetto4:7be519734feadd4c5bbca09947fe045555ce044ac8ca682fcb10fec4782845d9", trigger_word="soggetto_quattro", weight=0.95),
+            "soggetto_5": LoRAConfig(subject_id="soggetto_5", lora_path_or_id="umbepapa-collab/flux-lora-soggetto5:560c9862f969729057f5078c643964bd61754246c9d429c917d377a84ce0ed51", trigger_word="soggetto_cinque", weight=0.95),
+            "soggetto_6": LoRAConfig(subject_id="soggetto_6", lora_path_or_id="", trigger_word="soggetto_sei", weight=0.95),
+        }
+        self.sync_from_models(version=version)
+
+    @property
+    def version(self) -> Optional[str]:
+        return self._version
+
+    @staticmethod
+    def _metadata_suffix(version: Optional[str]) -> str:
+        return f"_{version}" if version else ""
+
+    @staticmethod
+    def _subject_num(subject_id: str) -> int:
+        return int(subject_id.rsplit("_", 1)[-1])
+
+    @staticmethod
+    def _resolve_weights_from_metadata(metadata: Dict[str, Any]) -> Optional[str]:
+        from provider_adapters import _resolve_lora_weights_url
+
+        return _resolve_lora_weights_url(metadata)
+
+    def sync_from_models(self, version: Optional[str] = None) -> None:
+        """Populate registry entries from models/lora_soggetto{N}[_{version}].json when present."""
+        ver = version if version is not None else self._version
+        suffix = self._metadata_suffix(ver)
+        for subject_id, cfg in self._registry.items():
+            num = self._subject_num(subject_id)
+            json_path = MODELS_DIR / f"lora_soggetto{num}{suffix}.json"
+            url_path = MODELS_DIR / f"lora_soggetto{num}{suffix}_url.txt"
+
+            if not json_path.is_file():
+                if ver:
+                    cfg.metadata_path = None
+                    cfg.lora_path_or_id = ""
+                    cfg.training_status = "missing"
+                elif not ver:
+                    cfg.metadata_path = None
+                    cfg.lora_path_or_id = ""
+                    cfg.training_status = "missing"
+                continue
+
+            try:
+                metadata = json.loads(json_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("[LoRA] Invalid metadata for %s: %s", subject_id, exc)
+                cfg.training_status = "invalid"
+                continue
+
+            if not isinstance(metadata, dict):
+                cfg.training_status = "invalid"
+                continue
+
+            cfg.metadata_path = str(json_path)
+            cfg.training_status = str(metadata.get("status", "unknown")).lower()
+            cfg.destination = str(
+                metadata.get("destination") or cfg.destination
+            ).strip()
+            trigger = str(metadata.get("trigger_word", "")).strip()
+            expected = self._EXPECTED_TRIGGERS.get(subject_id, "")
+            if trigger:
+                if expected and trigger != expected:
+                    logger.warning(
+                        "[LoRA] Trigger mismatch %s: metadata=%r expected=%r",
+                        subject_id,
+                        trigger,
+                        expected,
+                    )
+                cfg.trigger_word = trigger
+            elif expected:
+                cfg.trigger_word = expected
+
+            weights = self._resolve_weights_from_metadata(metadata)
+            if not weights and url_path.is_file():
+                sidecar = url_path.read_text(encoding="utf-8").strip()
+                if sidecar.startswith("http") or "/" in sidecar:
+                    weights = sidecar
+
+            if weights:
+                cfg.lora_path_or_id = weights
+            else:
+                cfg.lora_path_or_id = ""
+
+            gender_meta = str(
+                metadata.get("subject_gender", metadata.get("gender", ""))
+            ).strip().lower()
+            if gender_meta in ("male", "female"):
+                cfg.subject_gender = gender_meta
+            else:
+                cfg.subject_gender = self._load_subject_gender_from_dataset(num, ver)
+
+            logger.info(
+                "[LoRA] Synced %s status=%s trigger=%s gender=%s path=%s",
+                subject_id,
+                cfg.training_status,
+                cfg.trigger_word,
+                cfg.subject_gender or "unknown",
+                (cfg.lora_path_or_id or "")[:80],
+            )
+
+    @staticmethod
+    def _load_subject_gender_from_dataset(
+        subject_num: int, version: Optional[str]
+    ) -> Optional[str]:
+        """Read datasets/soggetto{N}_v*/gender.json or VIP gender.json."""
+        candidates: list[Path] = []
+        if subject_num == 2 and version == "vip":
+            candidates.append(Path("inputs") / "VIP_Dataset_Soggetto2" / "gender.json")
+        for suffix in (f"_{version}" if version else "", "_v3", ""):
+            folder = Path("datasets") / f"soggetto{subject_num}{suffix}"
+            candidates.append(folder / "gender.json")
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            gender = str(data.get("gender", "")).lower()
+            if gender in ("male", "female"):
+                return gender
+        return None
+
+    def get(self, subject_id: str) -> Optional[LoRAConfig]:
+        return self._registry.get(subject_id)
+
+    def iter_subjects(self) -> List[LoRAConfig]:
+        return [self._registry[k] for k in sorted(self._registry)]
+
+    def skip_reason(self, cfg: LoRAConfig) -> Optional[str]:
+        if not cfg.lora_path_or_id:
+            if cfg.training_status == "missing":
+                return "metadata JSON assente o senza weights_url"
+            if cfg.training_status not in ("succeeded", ""):
+                return f"training incomplete (status={cfg.training_status})"
+            return "lora_path_or_id vuoto"
+        if str(cfg.training_status).lower() != "succeeded":
+            return f"training incomplete (status={cfg.training_status})"
+        return None
 
 
 class CustomWeightsHandler:

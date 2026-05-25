@@ -208,6 +208,16 @@ class CoreEngineConfig:
 
     # I2V provider: "fal" | "replicate" | "fal_then_replicate"
     i2v_provider: str = "fal"
+
+    # Post-I2V face swap (Fal.ai pass-2 identity conditioning)
+    enable_post_i2v_face_swap: bool = False
+    subject_face_index_map: Optional[Dict[str, int]] = None
+    face_swap_require_face: bool = True
+
+    # Native LoRA identity injection (Flux first frame; skips post-I2V face swap)
+    use_lora_identity: bool = False
+    lora_metadata_paths: Optional[Dict[str, str]] = None  # subject_id -> metadata JSON path
+    lora_identity_scale: float = 0.85
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -229,6 +239,12 @@ class CoreEngineConfig:
         if self.reference_faces_dir and not self.subjects_payload:
             self.subjects_payload = {"subject_1": self.reference_faces_dir}
             logger.info("Converted single subject to subjects_payload format")
+
+        if not self.face_swap_require_face:
+            raise ValueError(
+                "face_swap_require_face=False is no longer supported; "
+                "face swap must succeed or raise IdentityConditioningError"
+            )
 
         if self.reference_faces_dir:
             self.reference_faces_dir = _resolve_dir_path(self.reference_faces_dir)
@@ -399,6 +415,7 @@ class CoreEngine:
         
         # Identity locker will be initialized per subject in multi-subject mode
         self.identity_locker = None
+        self._face_reference_urls: Dict[str, str] = {}
         
         # AnimateDiff engine
         anim_config = AnimateDiffConfig(
@@ -454,6 +471,42 @@ class CoreEngine:
             "i2v_timeout_multiplier": tuning["i2v_timeout_multiplier"],
             "guidance_scale": tuning["guidance_scale"],
         }
+
+    def _inject_lora_trigger_words(self, prompt: str) -> str:
+        """Append trained LoRA trigger tokens to the generation prompt."""
+        from provider_adapters import load_lora_metadata
+
+        if not self.config.lora_metadata_paths:
+            return prompt
+
+        triggers: List[str] = []
+        for metadata_path in self.config.lora_metadata_paths.values():
+            if not metadata_path:
+                continue
+            try:
+                metadata = load_lora_metadata(metadata_path)
+            except (OSError, ValueError) as exc:
+                logger.warning("Skipping LoRA metadata %s: %s", metadata_path, exc)
+                continue
+            trigger = str(metadata.get("trigger_word", "")).strip()
+            if trigger and trigger not in prompt:
+                triggers.append(trigger)
+
+        if not triggers:
+            return prompt
+        return f"{prompt}, {', '.join(triggers)}"
+
+    def _build_flux_loras_payload(self) -> Optional[List[Dict[str, Any]]]:
+        """Build Flux loras array when native LoRA identity mode is enabled."""
+        if not self.config.use_lora_identity:
+            return None
+        from provider_adapters import build_flux_loras_from_config
+
+        return build_flux_loras_from_config(
+            self.config.lora_metadata_paths,
+            identity_scale=self.config.lora_identity_scale,
+            include_realism_lora=True,
+        )
 
     @staticmethod
     def _is_content_policy_error(exc: Exception) -> bool:
@@ -589,6 +642,12 @@ class CoreEngine:
         
         # Apply negative prompting
         prompts = self._apply_negative_prompts(prompt)
+
+        if self.config.use_lora_identity:
+            prompts["prompt"] = self._inject_lora_trigger_words(prompts.get("prompt", ""))
+            logger.info(
+                "LoRA identity mode: trigger-augmented prompt (face swap disabled)"
+            )
         
         # Enhance prompt for multi-subject to prevent body entanglement
         if num_subjects > 1 and self.controlnet_handler:
@@ -604,6 +663,7 @@ class CoreEngine:
         self._notify_progress(PipelineStage.IDENTITY_EXTRACTION, 2, 7)
         
         identity_vectors, stability_scores = await self._extract_identity(final_subjects_payload)
+        await self._resolve_face_reference_urls(final_subjects_payload)
         
         stage2_time = self.progress_tracker.end_stage(PipelineStage.IDENTITY_EXTRACTION)
         
@@ -724,10 +784,25 @@ class CoreEngine:
         
         stage5_time = self.progress_tracker.end_stage(PipelineStage.VIDEO_GENERATION)
         
-        # STAGE 6: Finalization
+        # STAGE 6: Finalization (post-I2V face swap + download)
         self.progress_tracker.start_stage(PipelineStage.FINALIZATION)
         self._notify_progress(PipelineStage.FINALIZATION, 6, 7)
-        
+
+        if self.config.enable_post_i2v_face_swap:
+            if self.config.use_lora_identity:
+                logger.info(
+                    "STAGE 6: Skipping post-I2V face swap (native LoRA identity active)"
+                )
+            else:
+                raw_video_url = video_result.get("video_url", "")
+                logger.info(
+                    "STAGE 6: Post-I2V face swap (%d subject(s), multi=%s)...",
+                    num_subjects,
+                    num_subjects > 1,
+                )
+                swapped_url = await self._apply_post_i2v_face_swap(raw_video_url)
+                video_result = {**video_result, "video_url": swapped_url}
+
         final_video_url = await self._finalize_video(video_result, output_path)
         
         stage6_time = self.progress_tracker.end_stage(PipelineStage.FINALIZATION)
@@ -882,6 +957,115 @@ class CoreEngine:
         logger.info(f"  Average stability: {avg_stability*100:.1f}%")
         
         return identity_vectors, stability_scores
+
+    def _pick_face_reference_image(self, faces_dir: str) -> Path:
+        """Pick a stable reference face image from a subject directory."""
+        from identity_cache import IMAGE_EXTENSIONS
+
+        faces_path = Path(_resolve_dir_path(faces_dir))
+        images = sorted(
+            p
+            for p in faces_path.rglob("*")
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if not images:
+            raise ValueError(f"No face reference images found in {faces_dir}")
+        return images[0]
+
+    async def _upload_face_reference(self, subject_id: str, faces_dir: str) -> str:
+        """Upload per-subject face reference to Fal CDN and cache the URL."""
+        if subject_id in self._face_reference_urls:
+            return self._face_reference_urls[subject_id]
+
+        from i2v_router import ensure_public_media_url
+
+        local_path = self._pick_face_reference_image(faces_dir)
+        url = await ensure_public_media_url(str(local_path), self.api_key)
+        self._face_reference_urls[subject_id] = url
+        logger.info("[FACE_REF] %s uploaded from %s", subject_id, local_path.name)
+        return url
+
+    async def _resolve_face_reference_urls(self, subjects_payload: Dict[str, str]) -> None:
+        """Populate _face_reference_urls for every subject in stable order."""
+        for subject_id in sorted(subjects_payload.keys()):
+            faces_dir = subjects_payload[subject_id]
+            await self._upload_face_reference(subject_id, faces_dir)
+
+    def _target_face_index_for_subject(self, subject_id: str, ordinal: int) -> int:
+        """
+        Map subject_id to target face slot in the generated video.
+
+        Default: subject_1 -> 0 (left), subject_2 -> 1 (right), by sorted order.
+        Override via config.subject_face_index_map.
+        """
+        custom = self.config.subject_face_index_map or {}
+        if subject_id in custom:
+            return custom[subject_id]
+        return ordinal
+
+    async def _apply_sequential_multi_subject_face_swap(self, video_url: str) -> str:
+        """Chain face swaps: subject_1 then subject_2, output N feeds input N+1."""
+        from provider_adapters import apply_fal_face_swap
+
+        subjects = self.config.subjects_payload or {}
+        ordered_ids = sorted(subjects.keys())
+        current_url = video_url
+
+        for ordinal, subject_id in enumerate(ordered_ids):
+            face_url = self._face_reference_urls.get(subject_id)
+            if not face_url:
+                face_url = await self._upload_face_reference(
+                    subject_id, subjects[subject_id]
+                )
+            if not face_url:
+                raise RuntimeError(f"Missing face reference URL for {subject_id}")
+            target_idx = self._target_face_index_for_subject(subject_id, ordinal)
+            logger.info(
+                "[FACE_SWAP] sequential %d/%d: %s -> target_face_index=%d",
+                ordinal + 1,
+                len(ordered_ids),
+                subject_id,
+                target_idx,
+            )
+            current_url = await apply_fal_face_swap(
+                image_or_video_url=current_url,
+                face_image_url=face_url,
+                target_face_index=target_idx,
+                require_face=self.config.face_swap_require_face,
+                api_key=self.api_key,
+            )
+
+        return current_url
+
+    async def _apply_post_i2v_face_swap(self, video_url: str) -> str:
+        """Dispatch single- or multi-subject post-I2V face swap."""
+        if not self.config.enable_post_i2v_face_swap:
+            return video_url
+
+        subjects = self.config.subjects_payload or {}
+        if len(subjects) > 1:
+            return await self._apply_sequential_multi_subject_face_swap(video_url)
+
+        subject_id = next(iter(subjects))
+        face_url = self._face_reference_urls.get(subject_id)
+        if not face_url:
+            face_url = await self._upload_face_reference(
+                subject_id, subjects[subject_id]
+            )
+
+        from provider_adapters import apply_fal_face_swap
+
+        return await apply_fal_face_swap(
+            image_or_video_url=video_url,
+            face_image_url=face_url,
+            target_face_index=0,
+            require_face=self.config.face_swap_require_face,
+            api_key=self.api_key,
+        )
+
+    async def _apply_mandatory_segment_face_swap(self, video_url: str) -> str:
+        """Post-I2V face swap for each autoregressive segment (same as STAGE 6)."""
+        return await self._apply_post_i2v_face_swap(video_url)
     
     async def _process_controlnet(
         self,
@@ -974,6 +1158,11 @@ class CoreEngine:
             # Add ControlNet data if available
             if controlnet_data and "pose_map_path" in controlnet_data:
                 logger.info(f"ControlNet data available but not yet integrated with Flux endpoint")
+
+            loras = self._build_flux_loras_payload()
+            if loras:
+                payload["loras"] = loras
+                logger.info("Injecting %d LoRA(s) into Flux first-frame payload", len(loras))
         
         else:
             # Multi-subject - use regional prompting
@@ -1022,6 +1211,11 @@ class CoreEngine:
             # This implementation uses prompt-based regional guidance as a fallback
             logger.info("Note: Using prompt-based regional guidance")
             logger.info("Full regional IP-Adapter requires specialized endpoint support")
+
+            loras = self._build_flux_loras_payload()
+            if loras:
+                payload["loras"] = loras
+                logger.info("Injecting %d LoRA(s) into Flux first-frame payload", len(loras))
         
         # Define the actual API call as a nested async function for retry
         obfuscation_attempted = False
@@ -1326,9 +1520,12 @@ class CoreEngine:
         
         video_url = result.get('video_url', '')
         last_frame_url = result.get('last_frame_url') or ''
-        
+
         if not video_url:
             raise ValueError("Video URL not returned from generation")
+
+        if self.config.enable_post_i2v_face_swap and not self.config.use_lora_identity:
+            video_url = await self._apply_mandatory_segment_face_swap(video_url)
         
         if not last_frame_url:
             from i2v_router import ensure_last_frame_url

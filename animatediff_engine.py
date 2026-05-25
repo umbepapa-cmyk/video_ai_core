@@ -403,6 +403,9 @@ class AnimateDiffEngine:
                     else np.asarray(id_raw, dtype=np.float32)
                 )
 
+            force_replicate = os.getenv("FORCE_REPLICATE", "").strip().lower() in ("1", "true", "yes")
+            provider = "replicate" if force_replicate else os.getenv("I2V_PROVIDER", "fal")
+
             result = await generate_i2v_with_fallback(
                 image_url=payload.get("first_frame_url"),
                 prompt=payload.get("prompt", ""),
@@ -415,6 +418,7 @@ class AnimateDiffEngine:
                 draft_mode=draft_mode,
                 require_last_frame=require_last_frame,
                 api_key=self.api_key,
+                provider=provider,
                 stage_label=stage_label,
                 segment_index=segment_index,
                 segment_total=segment_total,

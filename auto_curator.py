@@ -73,7 +73,10 @@ DEFAULT_LORA_TOP_N = 20
 DEFAULT_MIN_SHORT_SIDE = 768
 DEFAULT_INPUTS_ROOT = Path("inputs")
 DATASETS_ROOT = Path("datasets")
-MAX_VIDEO_SAMPLES = 120
+VIDEO_SAMPLE_FPS = 1.0
+VIDEO_SCENE_CHANGE_HIST = 0.78
+# Anti-runaway for corrupted/infinite video loops only — NOT a user export cap.
+MAX_FRAMES_PER_VIDEO_SAFETY = 500
 SHARPNESS_NORMALIZE_SHORT = 720
 TIER_EXPORT_CAPS: dict[str, int] = {
     "A": 50,
@@ -1009,7 +1012,18 @@ def _video_frame_sharpness(frame: "np.ndarray") -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def _sample_video_frames(path: Path) -> Iterator[tuple["np.ndarray", str]]:
+def _sample_video_frames_diverse(
+    path: Path,
+    *,
+    min_sharpness: float = 0.0,
+    diversity_threshold: float = V3_DIVERSITY_HIST_THRESHOLD,
+) -> Iterator[tuple["np.ndarray", str]]:
+    """Yield every clean, non-redundant frame from a video (~1 fps + scene cuts).
+
+    Dedup is similarity-only (histogram correlation vs already-kept frames from
+    this video). There is no per-video count cap; MAX_FRAMES_PER_VIDEO_SAFETY
+    stops only corrupted/infinite decode loops.
+    """
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         logger.warning("Impossibile aprire video: %s", path)
@@ -1018,26 +1032,75 @@ def _sample_video_frames(path: Path) -> Iterator[tuple["np.ndarray", str]]:
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 24.0)
     if fps <= 0:
         fps = 24.0
-    step = max(1, int(round(fps)))
+    step = max(1, int(round(fps / VIDEO_SAMPLE_FPS)))
     frame_index = 0
-    sampled = 0
+    scanned = 0
+    kept = 0
+    accepted_frames: list["np.ndarray"] = []
+    last_sampled_frame: Optional["np.ndarray"] = None
+    hit_safety = False
 
     try:
-        while sampled < MAX_VIDEO_SAMPLES:
+        while True:
             ok, frame = capture.read()
             if not ok:
                 break
-            if frame_index % step == 0:
+            take = frame_index % step == 0
+            if not take and last_sampled_frame is not None:
+                if _histogram_correlation(frame, last_sampled_frame) < VIDEO_SCENE_CHANGE_HIST:
+                    take = True
+            if take:
+                scanned += 1
+                if scanned > MAX_FRAMES_PER_VIDEO_SAFETY:
+                    hit_safety = True
+                    logger.warning(
+                        "Video %s: safety cap %d candidati — possibile file corrotto",
+                        path.name,
+                        MAX_FRAMES_PER_VIDEO_SAFETY,
+                    )
+                    break
                 second = frame_index / fps
                 label = f"{path.name} @ {second:.0f}s"
-                yield frame, label
-                sampled += 1
+                sharpness = _video_frame_sharpness(frame)
+                if sharpness >= min_sharpness:
+                    too_similar = any(
+                        _histogram_correlation(frame, existing) >= diversity_threshold
+                        for existing in accepted_frames
+                    )
+                    if not too_similar:
+                        accepted_frames.append(frame)
+                        kept += 1
+                        yield frame, label
+                last_sampled_frame = frame
             frame_index += 1
     finally:
         capture.release()
 
-    if sampled == 0:
+    if scanned == 0:
         logger.warning("Nessun frame campionato da video: %s", path)
+    else:
+        logger.debug(
+            "Video %s: %d candidati @~%.0ffps, %d puliti+diversi%s",
+            path.name,
+            scanned,
+            VIDEO_SAMPLE_FPS,
+            kept,
+            " (safety cap)" if hit_safety else "",
+        )
+
+
+def _sample_video_frames(
+    path: Path,
+    *,
+    min_sharpness: float = 0.0,
+    diversity_threshold: float = V3_DIVERSITY_HIST_THRESHOLD,
+) -> Iterator[tuple["np.ndarray", str]]:
+    """Extract all clean, non-redundant frames from a video."""
+    yield from _sample_video_frames_diverse(
+        path,
+        min_sharpness=min_sharpness,
+        diversity_threshold=diversity_threshold,
+    )
 
 
 def _save_candidate_image(candidate: Candidate, output_path: Path) -> None:
@@ -1198,7 +1261,9 @@ def run_curation(
                 accepted.append(candidate)
                 continue
 
-            for frame, label in _sample_video_frames(media_path):
+            for frame, label in _sample_video_frames(
+                media_path, min_sharpness=sharpness_threshold
+            ):
                 candidate, reason = curator.evaluate(
                     frame,
                     source_label=label,
@@ -1365,7 +1430,9 @@ def run_lora_export(
                 accepted.append(candidate)
                 continue
 
-            for frame, label in _sample_video_frames(media_path):
+            for frame, label in _sample_video_frames(
+                media_path, min_sharpness=sharpness_threshold
+            ):
                 candidate, reason = curator.evaluate(
                     frame,
                     source_label=label,
@@ -1582,7 +1649,11 @@ def diagnose_media(
                 if image is not None:
                     frame_iter.append((image, media_path.name))
             elif suffix in VIDEO_EXTENSIONS:
-                frame_iter = list(_sample_video_frames(media_path))
+                frame_iter = list(
+                    _sample_video_frames(
+                        media_path, min_sharpness=prof.sharp_cf * 0.5
+                    )
+                )
 
             for image, _label in frame_iter:
                 fc = curator.count_faces(image)
@@ -1651,7 +1722,9 @@ def collect_tier_frames(
                 if image is not None:
                     frames.append((image, media_path.name, media_path))
             elif suffix in VIDEO_EXTENSIONS:
-                for frame, label in _sample_video_frames(media_path):
+                for frame, label in _sample_video_frames(
+                    media_path, min_sharpness=profile.sharp_cf * 0.5
+                ):
                     frames.append((frame, label, None))
 
             for image, label, image_path in frames:

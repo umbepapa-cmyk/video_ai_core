@@ -144,6 +144,34 @@ class SubjectTrackingLossError(Exception):
         return base_msg
 
 
+class BudgetExceededError(Exception):
+    """Raised when estimated pipeline cost exceeds the configured daily budget."""
+
+    def __init__(self, message: str, spent_usd: float = None, limit_usd: float = None):
+        super().__init__(message)
+        self.spent_usd = spent_usd
+        self.limit_usd = limit_usd
+
+
+class IdentityConditioningError(Exception):
+    """
+    Raised when post-I2V face swap or identity conditioning fails.
+
+    Used when Fal/Replicate face-swap models fail or no usable swapped output
+    is returned (including no-face-detected cases).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        subject_id: str = None,
+        target_face_index: int = None,
+    ):
+        super().__init__(message)
+        self.subject_id = subject_id
+        self.target_face_index = target_face_index
+
+
 class SpatialMaskingError(Exception):
     """
     Raised when spatial mask generation or application fails.
